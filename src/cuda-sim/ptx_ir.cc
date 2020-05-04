@@ -384,11 +384,26 @@ void function_info::create_basic_blocks() {
       new basic_block_t(bb_id++, *find_next_real_instruction(i), NULL, 1, 0));
   ptx_instruction *last_real_inst = *(l++);
 
+  #ifndef VirtualRegisterFile
+    printf("Reached Here !\n");
+    unsigned instCount = 0;
+  #endif
+
   for (; i != m_instructions.end(); i++) {
     ptx_instruction *pI = *i;
     if (l != leaders.end() && *i == *l) {
       // found start of next basic block
       m_basic_blocks.back()->ptx_end = last_real_inst;
+      #ifndef VirtualRegisterFile
+        m_basic_blocks.back()->ptx_begin->m_bbStartFlag = true;
+        m_basic_blocks.back()->ptx_begin->m_bbRegReleaseCount = 
+          ( last_real_inst->get_PC() - m_basic_blocks.back()->ptx_begin->get_PC() ) 
+           / m_basic_blocks.back()->ptx_begin->inst_size();
+        printf("BB: BB-%d: %d instructions: %d regRelease\n", 
+          bb_id-1, 
+          (last_real_inst->get_PC() - m_basic_blocks.back()->ptx_begin->get_PC())/m_basic_blocks.back()->ptx_begin->inst_size(), 
+          m_basic_blocks.back()->ptx_begin->m_bbRegReleaseCount);
+      #endif
       if (find_next_real_instruction(i) !=
           m_instructions.end()) {  // if not bogus trailing label
         m_basic_blocks.push_back(new basic_block_t(
@@ -397,11 +412,37 @@ void function_info::create_basic_blocks() {
       }
       // start search for next leader
       l++;
+      #ifndef VirtualRegisterFile
+        instCount = 0;
+      #endif
     }
+    #ifndef VirtualRegisterFile
+    else
+    {
+      if (!pI->is_label())
+      {
+        ++instCount;
+        //  Truncate BB every 16 instructions
+        if(instCount % 16 == 0)
+          pI->m_bbStartFlag = true;
+      }
+    }
+    #endif
     pI->assign_bb(m_basic_blocks.back());
     if (!pI->is_label()) last_real_inst = pI;
   }
   m_basic_blocks.back()->ptx_end = last_real_inst;
+  #ifndef VirtualRegisterFile
+    m_basic_blocks.back()->ptx_begin->m_bbStartFlag = true;
+    m_basic_blocks.back()->ptx_begin->m_bbRegReleaseCount = 
+      (last_real_inst->get_PC() - m_basic_blocks.back()->ptx_begin->get_PC())
+      / (m_basic_blocks.back()->ptx_begin->inst_size())
+      * (floor(last_real_inst->inst_size()/3));
+    printf("BB: BB-%d: %d instructions: %d regRelease\n", 
+    bb_id-1, 
+    (last_real_inst->get_PC() - m_basic_blocks.back()->ptx_begin->get_PC())/m_basic_blocks.back()->ptx_begin->inst_size(), 
+		m_basic_blocks.back()->ptx_begin->m_bbRegReleaseCount);
+  #endif
   m_basic_blocks.push_back(
       /*exit basic block*/ new basic_block_t(bb_id, NULL, NULL, 0, 1));
 }
@@ -628,16 +669,234 @@ void function_info::do_pdom() {
   }
   printf("GPGPU-Sim PTX: pre-decoding instructions for \'%s\'...\n",
          m_name.c_str());
+
+  #if 0
+
+    ptx_instruction *pI = NULL;
+    ptx_instruction *bbFirstInst = NULL;
+    ptx_instruction *bbLastInst = NULL;
+    int bbOffset;
+
+    for (unsigned ii = 0; ii < m_n; ++ii)
+    {
+      pI = m_instr_mem[ii];
+      if (pI->m_bbStartFlag)
+      {
+        bbOffset = 0;
+        bbFirstInst = pI;
+      }
+      else
+      {
+        ++bbOffset;
+        pI->m_bbFirstInst = bbFirstInst;
+        pI->m_bbOffset = bbOffset;
+      }
+      pI->pre_decode(this);
+      bbLastInst = pI;
+    }
+    
+    summarizeRegLifetime(bbLastInst->get_PC());
+
+    std::bitset<48> bbMask;
+    bbMask.reset();
+
+    addr_t bbFirstPC = m_instr_mem[0]->get_PC();
+    pI = NULL;
+    ptx_instruction *prev_pI = NULL;
+    ptx_instruction *bb_pI = NULL;
+
+    for (unsigned ii = 0; ii < m_n; ++ii)
+    {
+      pI = m_instr_mem[ii];
+      if (pI->m_bbStartFlag)
+      {
+        bb_pI = NULL;
+        if (prev_pI != NULL)
+        {
+          bb_pI = (ptx_instruction*)(prev_pI->m_bbFirstInst);
+          if (bb_pI != NULL)
+          {
+            if ((intptr_t)&(bb_pI) < 0)
+            {
+              break;
+            }
+            bb_pI->m_bbReleaseMask.reset();
+          }
+        }
+      
+        for (int i = 47; i > 0; --i )
+        {
+          if (bb_pI != NULL)
+            bb_pI->m_bbReleaseMask.set(i, bbMask.test(i));
+        }
+
+        bbMask.reset();
+        bbFirstPC = pI->get_PC();
+      }
+
+      //  Decode bits of PIR release information
+      if (pI->m_bbOffset >= 0 && pI->m_bbOffset < 16)
+      {
+        if (pI->m_operands.size() > 1)
+          if (pI->src1().is_last_read())
+            bbMask.set(pI->m_bbOffset * 3);
+
+        if (pI->m_operands.size() > 2)
+          if (pI->src2().is_last_read())
+            bbMask.set(pI->m_bbOffset * 3 + 1);
+
+        if (pI->m_operands.size() > 3)
+          if (pI->src3().is_last_read())
+            bbMask.set(pI->m_bbOffset * 3 + 2);
+      }
+      prev_pI = pI;
+    }
+    
+  #else
   for (unsigned ii = 0; ii < m_n;
        ii += m_instr_mem[ii]->inst_size()) {  // handle branch instructions
     ptx_instruction *pI = m_instr_mem[ii];
     pI->pre_decode();
   }
+  #endif
   printf("GPGPU-Sim PTX: ... done pre-decoding instructions for \'%s\'.\n",
          m_name.c_str());
   fflush(stdout);
   m_assembled = true;
 }
+
+void function_info::do_RFV_pdom() {
+  printf("Inside RFV PDOM \n");
+  create_basic_blocks();
+  connect_basic_blocks();
+  bool modified = false;
+  do {
+    find_dominators();
+    find_idominators();
+    modified = connect_break_targets();
+  } while (modified == true);
+
+  if (g_debug_execution >= 50) {
+    print_basic_blocks();
+    print_basic_block_links();
+    print_basic_block_dot();
+  }
+  if (g_debug_execution >= 2) {
+    print_dominators();
+  }
+  find_postdominators();
+  find_ipostdominators();
+  if (g_debug_execution >= 50) {
+    print_postdominators();
+    print_ipostdominators();
+  }
+  printf("GPGPU-Sim PTX: pre-decoding instructions for \'%s\'...\n",
+         m_name.c_str());
+
+  #ifndef VirtualRegisterFile
+
+    ptx_instruction *pI = NULL;
+    ptx_instruction *bbFirstInst = NULL;
+    ptx_instruction *bbLastInst = NULL;
+    int bbOffset = 0;
+
+    for (unsigned ii = 0; ii < m_n; )
+    {
+      pI = m_instr_mem[ii];
+      if (pI->m_bbStartFlag)
+      {
+        bbOffset = 0;
+        bbFirstInst = pI;
+      }
+      else
+      {
+        ++bbOffset;
+        pI->m_bbFirstInst = bbFirstInst;
+        pI->m_bbOffset = bbOffset;
+      }
+      pI->pre_decode(this);
+      bbLastInst = pI;
+      ii += pI->inst_size();
+      // printf("PreDecoding : %x\n", pI->get_PC());
+    }
+
+    fprintf(stderr, "Done PreDecode\n");
+    
+    fprintf(stderr, "Before Summarize\n");
+
+    summarizeRegLifetime(bbLastInst->get_PC());
+
+    fprintf(stderr, "After Summarize \n");
+
+    std::bitset<48> bbMask;
+    bbMask.reset();
+
+    addr_t bbFirstPC = m_instr_mem[0]->get_PC();
+    pI = NULL;
+    ptx_instruction *prev_pI = NULL;
+    ptx_instruction *bb_pI = NULL;
+
+    for (unsigned ii = 0; ii < m_n; ii += m_instr_mem[ii]->inst_size())
+    {
+      pI = m_instr_mem[ii];
+      if (pI->m_bbStartFlag)
+      {
+        bb_pI = NULL;
+        if (prev_pI != NULL)
+        {
+          bb_pI = (ptx_instruction*)(prev_pI->m_bbFirstInst);
+          if (bb_pI != NULL)
+          {
+            if ((intptr_t)&(bb_pI) < 0)
+            {
+              break;
+            }
+            bb_pI->m_bbReleaseMask.reset();
+          }
+        }
+      
+        for (int i = 47; i > 0; --i )
+        {
+          if (bb_pI != NULL)
+            bb_pI->m_bbReleaseMask.set(i, bbMask.test(i));
+        }
+
+        bbMask.reset();
+        bbFirstPC = pI->get_PC();
+      }
+
+      //  Decode bits of PIR release information
+      if (pI->m_bbOffset >= 0 && pI->m_bbOffset < 16)
+      {
+        if (pI->m_operands.size() > 1)
+          if (pI->src1().is_last_read())
+            bbMask.set(pI->m_bbOffset * 3);
+
+        if (pI->m_operands.size() > 2)
+          if (pI->src2().is_last_read())
+            bbMask.set(pI->m_bbOffset * 3 + 1);
+
+        if (pI->m_operands.size() > 3)
+          if (pI->src3().is_last_read())
+            bbMask.set(pI->m_bbOffset * 3 + 2);
+      }
+      prev_pI = pI;
+    }
+    
+  #else
+  for (unsigned ii = 0; ii < m_n;
+       ii += m_instr_mem[ii]->inst_size()) {  // handle branch instructions
+    ptx_instruction *pI = m_instr_mem[ii];
+    pI->pre_decode();
+  }
+  #endif
+  printf("GPGPU-Sim PTX: ... done pre-decoding instructions for \'%s\'.\n",
+         m_name.c_str());
+  fflush(stdout);
+  m_assembled = true;
+}
+
+
 void intersect(std::set<int> &A, const std::set<int> &B) {
   // return intersection of A and B in A
   for (std::set<int>::iterator a = A.begin(); a != A.end();) {
@@ -1196,6 +1455,11 @@ ptx_instruction::ptx_instruction(
     const char *file, unsigned line, const char *source,
     const core_config *config, gpgpu_context *ctx)
     : warp_inst_t(config), m_return_var(ctx) {
+  #ifndef VirtualRegsiterFile
+    m_bbStartFlag = false;
+    m_bbRegReleaseCount = 0;
+    m_reg_update = false;
+  #endif
   gpgpu_ctx = ctx;
   m_uid = ++(ctx->g_num_ptx_inst_uid);
   m_PC = 0;

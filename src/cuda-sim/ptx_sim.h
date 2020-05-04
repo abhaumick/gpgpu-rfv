@@ -471,6 +471,40 @@ class ptx_thread_info {
   ptx_cta_info *m_cta_info;
   ptx_reg_t m_last_set_operand_value;
 
+  #ifndef VirtualRegisterFile
+
+    enum regStatus { dead = 0, live };
+    enum regOperation { regRead = 0, regWrite };
+
+    typedef struct 
+    {
+      bool modified;
+      unsigned long long firstAccess;
+      unsigned long long lastRead;
+      unsigned long long lastWrite;
+      unsigned long long numAccess;
+      unsigned long long totalAccess;
+      unsigned long long numStateChanges;
+      regOperation lastOp;
+      regStatus state;
+      addr_t executed;
+    } regUsageStats_t;
+
+    std::map <const char*, regUsageStats_t*> m_regUsageStatsMap;
+
+    int check_release( addr_t pc );
+
+    void addRegStats( const char* regName, bool isRead );
+    bool findRegStats( const char* regName );
+    void updateRegStats( const char* regName, bool isRead, bool isLastRead,
+        const ptx_instruction* pI );
+    int getRegDeadCount( const inst_t* );
+    void checkRegDead( const ptx_instruction *pI );
+    bool isRegReady( const char *name, addr_t pc);
+    bool isRegReady( const class inst_t *inst ); 
+
+  #endif
+
  private:
   bool m_functionalSimulationMode;
   unsigned m_uid;

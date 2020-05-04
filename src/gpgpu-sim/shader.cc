@@ -4267,3 +4267,14 @@ void shader_core_ctx::checkExecutionStatusAndUpdate(warp_inst_t &inst,
     }
   }
 }
+
+#ifndef VirtualRegisterFile
+
+  void shader_core_ctx::renameReg (int cta_id, int warp_id, const char* name, 
+    int stat, unsigned long long cnt)
+  {
+    return;
+  }
+
+#endif
+

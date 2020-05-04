@@ -335,6 +335,10 @@ void function_info::ptx_assemble() {
       unsigned PC = m_instr_mem[index]->get_PC();
       m_symtab->set_label_address(target.get_symbol(), PC);
       target.set_type(label_t);
+      #ifndef VirtualRegisterFile
+        m_branchDeQ.push_back( m_instr_mem[ii + m_instr_mem[ii]->inst_size()] );  //  Branch Not Taken
+        m_branchTargetDeQ.push_back(PC);                                          //  Branch Taken
+      #endif
     }
   }
   m_n = n;
@@ -378,6 +382,109 @@ void function_info::ptx_assemble() {
 
    m_assembled = true;
 #endif
+
+  if (!is_pdom_set())
+  {
+    printf("Doing RFV PDOM\n");
+    do_RFV_pdom();
+    set_pdom();
+  }
+  
+  #if 0
+
+    ptx_instruction *pI = NULL;
+    ptx_instruction *bbFirstInst = NULL;
+    ptx_instruction *bbLastInst = NULL;
+    int bbOffset = 0;
+
+    for (unsigned ii = 0; ii < m_n; )
+    {
+      pI = (ptx_instruction*) m_instr_mem[ii];
+      if (pI->m_bbStartFlag)
+      {
+        bbOffset = 0;
+        bbFirstInst = pI;
+      }
+      else
+      {
+        ++bbOffset;
+        pI->m_bbFirstInst = bbFirstInst;
+        pI->m_bbOffset = bbOffset;
+      }
+      pI->pre_decode(this);
+      ii += pI->inst_size();
+      bbLastInst = pI;
+    }
+
+    summarizeRegLifetime(bbLastInst->get_PC());
+
+    std::bitset<48> bbMask;
+    bbMask.reset();
+
+    addr_t bbFirstPC = m_instr_mem[0]->get_PC();
+    pI = NULL;
+    ptx_instruction *prev_pI = NULL;
+    ptx_instruction *bb_pI = NULL;
+
+    for (unsigned ii = 0; ii < m_n; ++ii)
+    {
+      pI = m_instr_mem[ii];
+      if (pI->m_bbStartFlag)
+      {
+        bb_pI = NULL;
+        if (prev_pI != NULL)
+        {
+          bb_pI = (ptx_instruction*)(prev_pI->m_bbFirstInst);
+          if (bb_pI != NULL)
+          {
+            if ((intptr_t)&(bb_pI) < 0)
+            {
+              break;
+            }
+            bb_pI->m_bbReleaseMask.reset();
+          }
+        }
+      
+        for (int i = 47; i > 0; --i )
+        {
+          if (bb_pI != NULL)
+            bb_pI->m_bbReleaseMask.set(i, bbMask.test(i));
+        }
+
+        bbMask.reset();
+        bbFirstPC = pI->get_PC();
+      }
+
+      if (pI->m_bbOffset >= 0 && pI->m_bbOffset < 16)
+      {
+        if (pI->m_operands.size() > 1)
+          if (pI->src1().is_last_read())
+            bbMask.set(pI->m_bbOffset * 3);
+
+        if (pI->m_operands.size() > 2)
+          if (pI->src2().is_last_read())
+            bbMask.set(pI->m_bbOffset * 3 + 1);
+
+        if (pI->m_operands.size() > 3)
+          if (pI->src3().is_last_read())
+            bbMask.set(pI->m_bbOffset * 3 + 2);
+      }
+      prev_pI = pI;
+    }
+    
+  //#else
+  for (unsigned ii = 0; ii < m_n;
+       ii += m_instr_mem[ii]->inst_size()) {  // handle branch instructions
+    ptx_instruction *pI = m_instr_mem[ii];
+    pI->pre_decode();
+  }
+  //#endif
+  printf("GPGPU-Sim PTX: ... done pre-decoding instructions for \'%s\'.\n",
+         m_name.c_str());
+  fflush(stdout);
+  m_assembled = true;
+
+  #endif
 }
 
 addr_t shared_to_generic(unsigned smid, addr_t addr) {
@@ -1212,6 +1319,504 @@ void ptx_instruction::pre_decode() {
   m_decoded = true;
 }
 
+#ifndef VirtualRegisterFile
+void ptx_instruction::pre_decode(function_info *fi) {
+  pc = m_PC;
+  isize = m_inst_size;
+  for (unsigned i = 0; i < MAX_OUTPUT_VALUES; i++) {
+    out[i] = 0;
+  }
+  for (unsigned i = 0; i < MAX_INPUT_VALUES; i++) {
+    in[i] = 0;
+  }
+  incount = 0;
+  outcount = 0;
+  is_vectorin = 0;
+  is_vectorout = 0;
+  std::fill_n(arch_reg.src, MAX_REG_OPERANDS, -1);
+  std::fill_n(arch_reg.dst, MAX_REG_OPERANDS, -1);
+  pred = 0;
+  ar1 = 0;
+  ar2 = 0;
+  space = m_space_spec;
+  memory_op = no_memory_op;
+  data_size = 0;
+  if (has_memory_read() || has_memory_write()) {
+    unsigned to_type = get_type();
+    data_size = datatype2size(to_type);
+    memory_op = has_memory_read() ? memory_load : memory_store;
+  }
+
+  bool has_dst = false;
+
+  switch (get_opcode()) {
+#define OP_DEF(OP, FUNC, STR, DST, CLASSIFICATION) \
+  case OP:                                         \
+    has_dst = (DST != 0);                          \
+    break;
+#define OP_W_DEF(OP, FUNC, STR, DST, CLASSIFICATION) \
+  case OP:                                           \
+    has_dst = (DST != 0);                            \
+    break;
+#include "opcodes.def"
+#undef OP_DEF
+#undef OP_W_DEF
+    default:
+      printf("Execution error: Invalid opcode (0x%x)\n", get_opcode());
+      break;
+  }
+
+  switch (m_cache_option) {
+    case CA_OPTION:
+      cache_op = CACHE_ALL;
+      break;
+    case NC_OPTION:
+      cache_op = CACHE_L1;
+      break;
+    case CG_OPTION:
+      cache_op = CACHE_GLOBAL;
+      break;
+    case CS_OPTION:
+      cache_op = CACHE_STREAMING;
+      break;
+    case LU_OPTION:
+      cache_op = CACHE_LAST_USE;
+      break;
+    case CV_OPTION:
+      cache_op = CACHE_VOLATILE;
+      break;
+    case WB_OPTION:
+      cache_op = CACHE_WRITE_BACK;
+      break;
+    case WT_OPTION:
+      cache_op = CACHE_WRITE_THROUGH;
+      break;
+    default:
+      // if( m_opcode == LD_OP || m_opcode == LDU_OP )
+      if (m_opcode == MMA_LD_OP || m_opcode == LD_OP || m_opcode == LDU_OP)
+        cache_op = CACHE_ALL;
+      // else if( m_opcode == ST_OP )
+      else if (m_opcode == MMA_ST_OP || m_opcode == ST_OP)
+        cache_op = CACHE_WRITE_BACK;
+      else if (m_opcode == ATOM_OP)
+        cache_op = CACHE_GLOBAL;
+      break;
+  }
+
+  set_opcode_and_latency();
+  set_bar_type();
+
+  FILE* fp = fopen("_PRE_DECODE_", "a");
+  fprintf(fp, "\n... @ pc 0x%x %d..\n", pc, pc);
+
+  // Get register operands
+  int n = 0, m = 0;
+  ptx_instruction::const_iterator opr = op_iter_begin();
+  for (; opr != op_iter_end(); opr++, n++) {  // process operands
+    const operand_info &o = *opr;
+    if (has_dst && n == 0) {
+      // Do not set the null register "_" as an architectural register
+      if (o.is_reg() && !o.is_non_arch_reg()) {
+        out[0] = o.reg_num();
+        arch_reg.dst[0] = o.arch_reg_num();
+      } else if (o.is_vector()) {
+        is_vectorin = 1;
+        unsigned num_elem = o.get_vect_nelem();
+        if (num_elem >= 1) out[0] = o.reg1_num();
+        if (num_elem >= 2) out[1] = o.reg2_num();
+        if (num_elem >= 3) out[2] = o.reg3_num();
+        if (num_elem >= 4) out[3] = o.reg4_num();
+        if (num_elem >= 5) out[4] = o.reg5_num();
+        if (num_elem >= 6) out[5] = o.reg6_num();
+        if (num_elem >= 7) out[6] = o.reg7_num();
+        if (num_elem >= 8) out[7] = o.reg8_num();
+        for (int i = 0; i < num_elem; i++) arch_reg.dst[i] = o.arch_reg_num(i);
+      }
+    } else {
+      if (o.is_reg() && !o.is_non_arch_reg()) {
+        int reg_num = o.reg_num();
+        arch_reg.src[m] = o.arch_reg_num();
+
+        //  Process RegRead for LastRead markers
+        sprintf(reg_archNames.src[m], o.get_symbol()->name().c_str());
+        fprintf(fp, "ARCH REG RD S : %d %s @ pc %x\n", o.arch_reg_num(), reg_archNames.src[m], pc);
+
+        if (fi->searchRegLifetime(o.get_symbol()->name().c_str()))
+        {
+          std::map <const char*, operand_info*>::iterator ltIter;
+          ltIter = fi->m_regLifetimeMap.find(o.get_symbol()->name().c_str());
+          ltIter->second = &m_operands[n];
+          std::map <const char*, int>::iterator freqIter;
+          freqIter = fi->m_regAccessFreqMap.find(o.get_symbol()->name().c_str());
+          freqIter->second++;
+          fprintf(fp, " LtSearch : %s : Found Access# %d", 
+            o.get_symbol()->name().c_str(), freqIter->second);
+        }
+        else
+        {
+          m_operands[n].m_PC = pc;
+          std::pair < std::map <const char*, operand_info*>::iterator , bool> ltInsertRetVal;
+          ltInsertRetVal = fi->m_regLifetimeMap.insert( 
+            std::pair <const char*, operand_info*> (o.get_symbol()->name().c_str(), &m_operands[n])
+          );
+          
+          std::pair < std::map <const char*, int>::iterator , bool> freqInsertRetVal;
+          freqInsertRetVal = fi->m_regAccessFreqMap.insert(
+            std::pair <const char*, int> (o.get_symbol()->name().c_str(), 1)
+          );
+          fprintf(fp, " LtSearch : %s : Not Found  .. Inserting Access# 1\n", 
+            o.get_symbol()->name().c_str());
+        }
+        
+        
+        switch (m) {
+          case 0:
+            in[0] = reg_num;
+            break;
+          case 1:
+            in[1] = reg_num;
+            break;
+          case 2:
+            in[2] = reg_num;
+            break;
+          default:
+            break;
+        }
+        m++;
+      } else if (o.is_vector()) {
+        // assert(m == 0); //only support 1 vector operand (for textures) right
+        // now
+        is_vectorout = 1;
+        unsigned num_elem = o.get_vect_nelem();
+        if (num_elem >= 1) in[m + 0] = o.reg1_num();
+        if (num_elem >= 2) in[m + 1] = o.reg2_num();
+        if (num_elem >= 3) in[m + 2] = o.reg3_num();
+        if (num_elem >= 4) in[m + 3] = o.reg4_num();
+        if (num_elem >= 5) in[m + 4] = o.reg5_num();
+        if (num_elem >= 6) in[m + 5] = o.reg6_num();
+        if (num_elem >= 7) in[m + 6] = o.reg7_num();
+        if (num_elem >= 8) in[m + 7] = o.reg8_num();
+        for (int i = 0; i < num_elem; i++)
+        {
+          arch_reg.src[m + i] = o.arch_reg_num(i);
+          sprintf(reg_archNames.src[i], o.vec_symbol(i)->name().c_str());
+          fprintf(fp, "ARCH REG RD V : %d %s @ pc %x\n", o.arch_reg_num(i), reg_archNames.src[i], pc);
+
+          if (fi->searchRegLifetime(o.vec_symbol(i)->name().c_str()))
+          {
+            m_operands[n].m_PC = pc;
+
+            std::map <const char*, operand_info*>::iterator ltIter;
+            ltIter = fi->m_regLifetimeMap.find(o.vec_symbol(i)->name().c_str());
+            ltIter->second = &m_operands[n];
+
+            std::map <const char*, int>::iterator freqIter;
+            freqIter = fi->m_regAccessFreqMap.find(o.vec_symbol(i)->name().c_str());
+            freqIter->second++;
+            fprintf(fp, " LtSearch : %s : Found Access# %d", 
+              o.vec_symbol(i)->name().c_str(), freqIter->second);
+          }
+          else
+          {
+            m_operands[n].m_PC = pc;
+            std::pair < std::map <const char*, operand_info*>::iterator , bool> ltInsertRetVal;
+            ltInsertRetVal = fi->m_regLifetimeMap.insert(
+              std::pair <const char*, operand_info*> (o.vec_symbol(i)->name().c_str(), &m_operands[n])
+            );            
+            std::pair < std::map <const char*, int>::iterator , bool> freqInsertRetVal;
+            freqInsertRetVal = fi->m_regAccessFreqMap.insert(
+              std::pair <const char*, int> (o.vec_symbol(i)->name().c_str(), 1)
+            );
+            fprintf(fp, " LtSearch : %s : Not Found  .. Inserting Access# 1\n", 
+              o.vec_symbol(i)->name().c_str());
+          }
+        }
+        m += num_elem;
+      }
+    }
+  }
+
+  // Setting number of input and output operands which is required for
+  // scoreboard check
+  for (int i = 0; i < MAX_OUTPUT_VALUES; i++)
+    if (out[i] > 0) outcount++;
+
+  for (int i = 0; i < MAX_INPUT_VALUES; i++)
+    if (in[i] > 0) incount++;
+
+  // Get predicate
+  if (has_pred()) {
+    const operand_info &p = get_pred();
+    pred = p.reg_num();
+  }
+
+  // Get address registers inside memory operands.
+  // Assuming only one memory operand per instruction,
+  //  and maximum of two address registers for one memory operand.
+  n = 0;
+  if (has_memory_read() || has_memory_write()) {
+    ptx_instruction::const_iterator op = op_iter_begin();
+    for (; op != op_iter_end(); op++, n++) {  // process operands
+      const operand_info &o = *op;
+
+      if (o.is_memory_operand()) {
+        // We do not support the null register as a memory operand
+        assert(!o.is_non_arch_reg());
+
+        // Check PTXPlus-type operand
+        // memory operand with addressing (ex. s[0x4] or g[$r1])
+        if (o.is_memory_operand2()) {
+          // memory operand with one address register (ex. g[$r1+0x4] or
+          // s[$r2+=0x4])
+          if (o.get_double_operand_type() == 0 ||
+              o.get_double_operand_type() == 3) {
+            ar1 = o.reg_num();
+            arch_reg.src[4] = o.arch_reg_num();
+            // TODO: address register in $r2+=0x4 should be an output register
+            // as well
+            sprintf(reg_archNames.src[4], o.get_symbol()->name().c_str());
+            fprintf(fp, "ARCH REG RD Mem1: %d %s @ pc %x\n", o.arch_reg_num(), reg_archNames.src[4], pc);
+            if (fi->searchRegLifetime(o.get_symbol()->name().c_str()))
+            {
+              m_operands[n].m_PC = pc;
+              std::map <const char*, operand_info*>::iterator ltIter;
+              ltIter = fi->m_regLifetimeMap.find(o.get_symbol()->name().c_str());
+              ltIter->second = &m_operands[n];
+
+              std::map <const char*, int>::iterator freqIter;
+              freqIter = fi->m_regAccessFreqMap.find(o.get_symbol()->name().c_str());
+              freqIter->second++;
+              fprintf(fp, " LtSearch : %s : Found Access# %d", 
+                o.get_symbol()->name().c_str(), freqIter->second);
+            }
+            else
+            {
+              m_operands[n].m_PC = pc;
+              std::pair < std::map <const char*, operand_info*>::iterator , bool> ltInsertRetVal;
+              ltInsertRetVal = fi->m_regLifetimeMap.insert(
+                std::pair <const char*, operand_info*> (o.get_symbol()->name().c_str(), &m_operands[n])
+              );
+              std::pair < std::map <const char*, int>::iterator , bool> freqInsertRetVal;
+              freqInsertRetVal = fi->m_regAccessFreqMap.insert(
+                std::pair <const char*, int> (o.get_symbol()->name().c_str(), 1)
+              );
+              fprintf(fp, " LtSearch : %s : Not Found  .. Inserting Access# 1\n", 
+                o.get_symbol()->name().c_str());
+            }
+                      
+          }
+          // memory operand with two address register (ex. s[$r1+$r1] or
+          // g[$r1+=$r2])
+          else if (o.get_double_operand_type() == 1 ||
+                   o.get_double_operand_type() == 2) {
+            ar1 = o.reg1_num();
+            arch_reg.src[4] = o.arch_reg_num();
+            ar2 = o.reg2_num();
+            arch_reg.src[5] = o.arch_reg_num();
+            // TODO: first address register in $r1+=$r2 should be an output
+            // register as well
+            sprintf(reg_archNames.src[4], o.vec_symbol(0)->name().c_str());
+            sprintf(reg_archNames.src[5], o.vec_symbol(1)->name().c_str());
+            fprintf(fp, "ARCH REG RD Mem1: %d %s @ pc %x\n", o.arch_reg_num(), reg_archNames.src[5], pc);
+            fprintf(fp, "ARCH REG RD Mem1: %d %s @ pc %x\n", o.arch_reg_num(), reg_archNames.src[5], pc);
+            for (auto i = 0; i <= 1; i++)
+            {
+              if (fi->searchRegLifetime(o.vec_symbol(i)->name().c_str()))
+              {
+                m_operands[n].m_PC = pc;
+                std::map <const char*, operand_info*>::iterator ltIter;
+                ltIter = fi->m_regLifetimeMap.find(o.vec_symbol(i)->name().c_str());
+                ltIter->second = &m_operands[n];
+
+                std::map <const char*, int>::iterator freqIter;
+                freqIter = fi->m_regAccessFreqMap.find(o.vec_symbol(i)->name().c_str());
+                freqIter->second++;
+                fprintf(fp, " LtSearch : %s : Found Access# %d", 
+                  o.vec_symbol(i)->name().c_str(), freqIter->second);
+              }
+              else
+              {
+                m_operands[n].m_PC = pc;
+                std::pair < std::map <const char*, operand_info*>::iterator , bool> ltInsertRetVal;
+                ltInsertRetVal = fi->m_regLifetimeMap.insert(
+                  std::pair <const char*, operand_info*> (o.vec_symbol(i)->name().c_str(), &m_operands[n])
+                );
+                std::pair < std::map <const char*, int>::iterator , bool> freqInsertRetVal;
+                freqInsertRetVal = fi->m_regAccessFreqMap.insert(
+                  std::pair <const char*, int> (o.vec_symbol(i)->name().c_str(), 1)
+                );
+                fprintf(fp, " LtSearch : %s : Not Found  .. Inserting Access# 1\n", 
+                  o.vec_symbol(i)->name().c_str());
+              }
+            }
+          }
+        } else if (o.is_immediate_address()) {
+        }
+        // Regular PTX operand
+        else if (o.get_symbol()
+                     ->type()
+                     ->get_key()
+                     .is_reg()) {  // Memory operand contains a register
+          ar1 = o.reg_num();
+          arch_reg.src[4] = o.arch_reg_num();
+
+          sprintf(reg_archNames.src[4], o.get_symbol()->name().c_str());
+          fprintf(fp, "ARCH REG RD Mem1: %d %s @ pc %x\n", o.arch_reg_num(), reg_archNames.src[4], pc);
+          if (fi->searchRegLifetime(o.get_symbol()->name().c_str()))
+          {
+            m_operands[n].m_PC = pc;
+            auto ltIter = fi->m_regLifetimeMap.find(o.get_symbol()->name().c_str());
+            ltIter->second = &m_operands[n];
+            auto freqIter = fi->m_regAccessFreqMap.find(o.get_symbol()->name().c_str());
+            freqIter->second++;
+            fprintf(fp, " LtSearch : %s : Found Access# %d", 
+              o.get_symbol()->name().c_str(), freqIter->second);
+          }
+          else
+          {
+            m_operands[n].m_PC = pc;
+            std::pair < std::map <const char*, operand_info*>::iterator , bool> ltInsertRetVal;
+            ltInsertRetVal = fi->m_regLifetimeMap.insert(
+              std::pair <const char*, operand_info*> (o.get_symbol()->name().c_str(), &m_operands[n])
+            );
+            std::pair < std::map <const char*, int>::iterator , bool> freqInsertRetVal;
+            freqInsertRetVal = fi->m_regAccessFreqMap.insert(
+              std::pair <const char*, int> (o.get_symbol()->name().c_str(), 1)
+            );
+            fprintf(fp, " LtSearch : %s : Not Found  .. Inserting Access# 1\n", 
+              o.get_symbol()->name().c_str());
+          }
+          
+          
+        }
+      }
+    }
+  }
+
+
+  if (has_dst)
+  {
+    bool deadRegFlag = false;
+    if (!m_operands.empty())
+    {
+      operand_info &o = dst();
+      bool inDivergeFlag = false;
+      for ( auto i = 0; i < fi->m_branchDeQ.size(); ++i)
+      {
+        ptx_instruction *branch_pI = fi->m_branchDeQ[i];
+        addr_t branchTarget = fi->m_branchTargetDeQ[i];
+        if (pc < branchTarget && branch_pI->get_PC() < pc)
+          inDivergeFlag = true;
+      }
+
+      // Do not set the null register "_" as an architectural register
+      if (o.is_reg() && !o.is_non_arch_reg())
+      {
+        out[0] = o.reg_num();
+        arch_reg.dst[0] = o.arch_reg_num();
+
+        sprintf(reg_archNames.dst[0], o.get_symbol()->name().c_str());
+        fprintf(fp, "ARCH REG WR: %d %s @ pc %x\n", o.arch_reg_num(), reg_archNames.dst[0], pc);	
+        if (fi->searchRegLifetime(o.get_symbol()->name().c_str()))
+        {
+          std::map <const char*, operand_info*>::iterator ltIter;
+          ltIter = fi->m_regLifetimeMap.find(o.get_symbol()->name().c_str());
+          if (ltIter->second->m_PC != pc && !inDivergeFlag)
+          {
+            bool isModifiedFlag = fi->isRegModifiedByBranch(ltIter);
+            if (!isModifiedFlag)
+              deadRegFlag = true;
+          }
+        }
+        //  Handle RegWrite
+        if (fi->searchRegWrite(o.get_symbol()->name().c_str()))
+        {
+          m_operands[0].m_PC = pc;
+          auto wrMapIter = fi->m_regWriteMap.find(o.get_symbol()->name().c_str());
+          wrMapIter->second = &m_operands[0];
+          fprintf(fp, "%d %s found in regWrMap .. updating", o.arch_reg_num(), o.get_symbol()->name().c_str());
+        }
+        else
+        {
+          fprintf(fp, "%d %s not found in regWrMap .. inserting firstWrite", o.arch_reg_num(), o.get_symbol()->name().c_str());
+          m_operands[0].m_PC = pc;
+          std::pair < std::map <const char*, operand_info*>::iterator , bool> wrInsertRetVal;
+          wrInsertRetVal = fi->m_regWriteMap.insert(
+            std::pair <const char*, operand_info*> (o.get_symbol()->name().c_str(), &m_operands[0])
+          );
+          std::pair < std::map <const char*, operand_info*>::iterator , bool> firstWrInsertRetVal;
+          firstWrInsertRetVal = fi->m_regFirstWriteMap.insert(
+            std::pair <const char*, operand_info*> (o.get_symbol()->name().c_str(), &m_operands[0])
+          );
+        }
+        
+      }
+      else if (o.is_vector())
+      {
+        is_vectorin = 1;
+        unsigned num_elem = o.get_vect_nelem();
+        if (num_elem >= 1) in[m + 0] = o.reg1_num();
+        if (num_elem >= 2) in[m + 1] = o.reg2_num();
+        if (num_elem >= 3) in[m + 2] = o.reg3_num();
+        if (num_elem >= 4) in[m + 3] = o.reg4_num();
+        if (num_elem >= 5) in[m + 4] = o.reg5_num();
+        if (num_elem >= 6) in[m + 5] = o.reg6_num();
+        if (num_elem >= 7) in[m + 6] = o.reg7_num();
+        if (num_elem >= 8) in[m + 7] = o.reg8_num();
+        for (int i = 0; i < num_elem; i++)
+        {
+          arch_reg.dst[i] = o.arch_reg_num(i);
+          sprintf(reg_archNames.dst[i], o.vec_symbol(i)->name().c_str());
+          fprintf(fp, "ARCH REG WR V: %d %s @ pc %x\n", o.arch_reg_num(i), reg_archNames.dst[i], pc);
+          if (fi->searchRegLifetime(o.vec_symbol(i)->name().c_str()))
+          {
+            std::map <const char*, operand_info*>::iterator ltIter;
+            ltIter = fi->m_regLifetimeMap.find(o.vec_symbol(i)->name().c_str());
+            if (ltIter->second->m_PC != pc && !inDivergeFlag)
+            {
+              ltIter->second->set_last_read();
+              bool isModifiedFlag = fi->isRegModifiedByBranch(ltIter);
+            }
+          }
+          //  Handle RegWrite
+          if (fi->searchRegWrite(o.vec_symbol(i)->name().c_str()))
+          {
+            fprintf(fp, "%d %s found in regWrMap .. updating", o.arch_reg_num(i), o.vec_symbol(i)->name().c_str());
+            m_operands[i].m_PC = pc;
+            auto wrMapIter = fi->m_regWriteMap.find(o.vec_symbol(i)->name().c_str());
+            wrMapIter->second = &m_operands[i];
+          }
+          else
+          {
+            fprintf(fp, "%d %s found in regWrMap .. updating", o.arch_reg_num(i), o.vec_symbol(i)->name().c_str());
+            m_operands[i].m_PC = pc;
+            std::pair < std::map <const char*, operand_info*>::iterator , bool> wrInsertRetVal;
+            wrInsertRetVal = fi->m_regWriteMap.insert(
+              std::pair <const char*, operand_info*> (o.vec_symbol(i)->name().c_str(), &m_operands[i])
+            );
+            std::pair < std::map <const char*, operand_info*>::iterator , bool> firstWrInsertRetVal;
+            firstWrInsertRetVal = fi->m_regFirstWriteMap.insert(
+              std::pair <const char*, operand_info*> (o.vec_symbol(i)->name().c_str(), &m_operands[i])
+            );
+          }
+          
+        }
+      }
+      if (deadRegFlag)
+        printf("%d] instruction regRelease\n", pc);
+    }
+  }
+
+
+  // get reconvergence pc
+  reconvergence_pc = gpgpu_ctx->func_sim->get_converge_point(pc);
+
+  m_decoded = true;
+  fflush(fp);
+  fclose(fp);
+}
+#endif
+
 void function_info::add_param_name_type_size(unsigned index, std::string name,
                                              int type, size_t size, bool ptr,
                                              memory_space_t space) {
@@ -1747,6 +2352,103 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
         pI = pJ;
       }
 
+      #ifndef VirtualRegisterFile
+        bool hasDeadRegs = false;
+        if (pI->m_operands.size() > 1)
+        {
+          const operand_info &src1 = pI->src1();
+          if (src1.is_last_read())
+            hasDeadRegs = true;
+          
+          if (src1.is_vector())
+          {
+            for (int i = 0; i < src1.get_vect_nelem(); ++i)
+              updateRegStats(src1.vec_symbol(i)->name().c_str(), false, false, pI);
+          }
+          else if (src1.is_reg())
+            updateRegStats(src1.get_symbol()->name().c_str(), true, src1.is_last_read(), pI);
+          else if (src1.is_memory_operand())
+          {
+            if (src1.get_type() == symbolic_t || src1.get_type() == reg_t)
+            {
+              const type_info_key &tInfo = src1.get_symbol()->type()->get_key();
+              if (tInfo.is_reg())
+                updateRegStats(src1.get_symbol()->name().c_str(), true, src1.is_last_read(), pI);
+            }
+          }          
+        }
+
+        if (pI->m_operands.size() > 2)
+        {
+          const operand_info &src2 = pI->src2();
+          if (src2.is_last_read())
+            hasDeadRegs = true;
+
+          if (src2.is_vector())
+          {
+            for (int i = 0; i < src2.get_vect_nelem(); ++i)
+              updateRegStats(src2.vec_symbol(i)->name().c_str(), false, false, pI);
+          }
+          else if (src2.is_reg())
+            updateRegStats(src2.get_symbol()->name().c_str(), true, src2.is_last_read(), pI);
+          else if (src2.is_memory_operand())
+          {
+            if (src2.get_type() == symbolic_t || src2.get_type() == reg_t)
+            {
+              const type_info_key &tInfo = src2.get_symbol()->type()->get_key();
+              if (tInfo.is_reg())
+                updateRegStats(src2.get_symbol()->name().c_str(), true, src2.is_last_read(), pI);
+            }
+          }  
+        }
+
+        if (pI->m_operands.size() > 3)
+        {
+          const operand_info &src3 = pI->src3();
+          if (src3.is_last_read())
+            hasDeadRegs = true;
+
+          if (src3.is_vector())
+          {
+            for (int i = 0; i < src3.get_vect_nelem(); ++i)
+              updateRegStats(src3.vec_symbol(i)->name().c_str(), false, false, pI);
+          }
+          else if (src3.is_reg())
+            updateRegStats(src3.get_symbol()->name().c_str(), true, src3.is_last_read(), pI);
+          else if (src3.is_memory_operand())
+          {
+            if (src3.get_type() == symbolic_t || src3.get_type() == reg_t)
+            {
+              const type_info_key &tInfo = src3.get_symbol()->type()->get_key();
+              if (tInfo.is_reg())
+                updateRegStats(src3.get_symbol()->name().c_str(), true, src3.is_last_read(), pI);
+            }
+          }
+        }
+
+        if (!pI->m_operands.empty())
+        {
+          const operand_info &dst = pI->dst();
+          if (dst.is_vector())
+          {
+            for (int i = 0; i < dst.get_vect_nelem(); ++i)
+              updateRegStats(dst.vec_symbol(i)->name().c_str(), false, false, pI);
+          }
+          else if (dst.is_reg())
+            updateRegStats(dst.get_symbol()->name().c_str(), false, false, pI);
+          else if (dst.is_memory_operand())
+          {
+            if (dst.get_type() == symbolic_t || dst.get_type() == reg_t)
+            {
+              const type_info_key &tInfo = dst.get_symbol()->type()->get_key();
+              if (tInfo.is_reg())
+                updateRegStats(dst.get_symbol()->name().c_str(), true, false, pI);
+            }
+          }
+        }
+        
+      #endif
+
       if (((inst_opcode == MMA_OP || inst_opcode == MMA_LD_OP ||
             inst_opcode == MMA_ST_OP))) {
         if (inst.active_count() != MAX_WARP_SIZE) {
@@ -1788,6 +2490,10 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
       // Run exit instruction if exit option included
       if (pI->is_exit()) exit_impl(pI, this);
     }
+
+    #ifndef VirtualRegisterFile
+      checkRegDead(pI);
+    #endif
 
     const gpgpu_functional_sim_config &config = m_gpu->get_config();
 

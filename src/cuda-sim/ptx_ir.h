@@ -393,7 +393,10 @@ class operand_info {
     m_immediate_address = false;
     m_addr_offset = 0;
     m_value.m_symbolic = NULL;
-  }
+    #ifndef VirtualRegisterFile
+      m_last_read = false;
+    #endif
+      }
   operand_info(const symbol *addr, gpgpu_context *ctx) {
     init(ctx);
     m_is_non_arch_reg = false;
@@ -435,6 +438,9 @@ class operand_info {
     m_neg_pred = false;
     m_is_return_var = false;
     m_immediate_address = false;
+    #ifndef VirtualRegisterFile
+      m_last_read = false;
+    #endif
   }
   operand_info(const symbol *addr1, const symbol *addr2, gpgpu_context *ctx) {
     init(ctx);
@@ -461,6 +467,9 @@ class operand_info {
     m_neg_pred = false;
     m_is_return_var = false;
     m_immediate_address = false;
+    #ifndef VirtualRegisterFile
+      m_last_read = false;
+    #endif
   }
   operand_info(int builtin_id, int dim_mod, gpgpu_context *ctx) {
     init(ctx);
@@ -479,6 +488,9 @@ class operand_info {
     m_neg_pred = false;
     m_is_return_var = false;
     m_immediate_address = false;
+    #ifndef VirtualRegisterFile
+      m_last_read = false;
+    #endif
   }
   operand_info(const symbol *addr, int offset, gpgpu_context *ctx) {
     init(ctx);
@@ -497,6 +509,9 @@ class operand_info {
     m_neg_pred = false;
     m_is_return_var = false;
     m_immediate_address = false;
+    #ifndef VirtualRegisterFile
+      m_last_read = false;
+    #endif
   }
   operand_info(unsigned x, gpgpu_context *ctx) {
     init(ctx);
@@ -515,6 +530,9 @@ class operand_info {
     m_neg_pred = false;
     m_is_return_var = false;
     m_immediate_address = true;
+    #ifndef VirtualRegisterFile
+      m_last_read = false;
+    #endif
   }
   operand_info(int x, gpgpu_context *ctx) {
     init(ctx);
@@ -533,6 +551,9 @@ class operand_info {
     m_neg_pred = false;
     m_is_return_var = false;
     m_immediate_address = false;
+    #ifndef VirtualRegisterFile
+      m_last_read = false;
+    #endif
   }
   operand_info(float x, gpgpu_context *ctx) {
     init(ctx);
@@ -551,6 +572,9 @@ class operand_info {
     m_neg_pred = false;
     m_is_return_var = false;
     m_immediate_address = false;
+    #ifndef VirtualRegisterFile
+      m_last_read = false;
+    #endif
   }
   operand_info(double x, gpgpu_context *ctx) {
     init(ctx);
@@ -569,6 +593,9 @@ class operand_info {
     m_neg_pred = false;
     m_is_return_var = false;
     m_immediate_address = false;
+    #ifndef VirtualRegisterFile
+      m_last_read = false;
+    #endif
   }
   operand_info(const symbol *s1, const symbol *s2, const symbol *s3,
                const symbol *s4, gpgpu_context *ctx) {
@@ -596,6 +623,9 @@ class operand_info {
     m_neg_pred = false;
     m_is_return_var = false;
     m_immediate_address = false;
+    #ifndef VirtualRegisterFile
+      m_last_read = false;
+    #endif
   }
   operand_info(const symbol *s1, const symbol *s2, const symbol *s3,
                const symbol *s4, const symbol *s5, const symbol *s6,
@@ -624,6 +654,9 @@ class operand_info {
     m_neg_pred = false;
     m_is_return_var = false;
     m_immediate_address = false;
+    #ifndef VirtualRegisterFile
+      m_last_read = false;
+    #endif
   }
 
   void init(gpgpu_context *ctx) {
@@ -654,6 +687,9 @@ class operand_info {
     m_neg_pred = 0;
     m_is_return_var = 0;
     m_is_non_arch_reg = 0;
+    #ifndef VirtualRegisterFile
+      m_last_read = false;
+    #endif
   }
   void make_memory_operand() { m_type = memory_t; }
   void set_return() { m_is_return_var = true; }
@@ -886,6 +922,24 @@ class operand_info {
   bool m_is_non_arch_reg;
 
   unsigned get_uid();
+  #ifndef VirtualRegisterFile
+  public:
+    addr_t m_PC;
+	  // for check reg lifetime
+    bool m_last_read;
+    bool is_last_read() const
+    {
+       return m_last_read;
+    }
+    void set_last_read()
+    {
+       m_last_read = true;
+    }
+    void reset_last_read()
+    {
+       m_last_read = false;
+    }
+  #endif
 };
 
 extern const char *g_opcode_string[];
@@ -1135,7 +1189,9 @@ class ptx_instruction : public warp_inst_t {
   int m_pred_mod;
   int m_opcode;
   const symbol *m_label;
+public:
   std::vector<operand_info> m_operands;
+private:
   operand_info m_return_var;
 
   std::list<int> m_options;
@@ -1171,9 +1227,43 @@ class ptx_instruction : public warp_inst_t {
   unsigned m_inst_size;   // bytes
 
   virtual void pre_decode();
+  #ifndef VirtualRegisterFile
+    virtual void pre_decode(function_info* fi); 
+  #endif
   friend class function_info;
   // backward pointer
   class gpgpu_context *gpgpu_ctx;
+
+  #ifndef VirtualRegisterFile
+  public:
+    bool m_reg_update;
+    std::vector<const char*> m_dead_regs;
+    
+    void addDeadReg(const char* name)
+    {
+	   for(int i = 0; i < m_dead_regs.size(); i++)
+      {
+        if(!strncmp(m_dead_regs[i], name, sizeof(name)))
+			  return;
+      }
+      m_dead_regs.push_back(name);
+      /*
+	      printf("%d] STATIC DEAD_REGS: %d ", m_PC, m_dead_regs.size()); 
+	      for(int i = 0; i < m_dead_regs.size(); i++)
+		      printf("%s ", m_dead_regs[i]);
+
+	      printf("\n");
+      */
+   }
+
+    void searchRemoveDeadReg(const char* name)
+    {
+	   for(int i = 0; i < m_dead_regs.size(); i++)
+       	if(!strncmp(m_dead_regs[i], name, sizeof(name)))
+  	    	m_dead_regs.erase(m_dead_regs.begin()+i);
+    }
+
+  #endif
 };
 
 class param_info {
@@ -1291,6 +1381,7 @@ class function_info {
   void find_ipostdominators();
   void print_ipostdominators();
   void do_pdom();  // function to call pdom analysis
+  void do_RFV_pdom();  // function to call pdom analysis
 
   unsigned get_num_reconvergence_pairs();
 
@@ -1410,6 +1501,210 @@ class function_info {
   int m_args_aligned_size;
 
   addr_t m_n;  // offset in m_instr_mem (used in do_pdom)
+
+  #ifndef VirtualRegisterFile
+
+  public:
+    std::map <const char*, operand_info*> m_regWriteMap;   //  Last Wr Instruction
+    std::map <const char*, operand_info*> m_regFirstWriteMap;
+    std::map <const char*, operand_info*> m_regLifetimeMap;
+    std::map <const char*, int> m_regAccessFreqMap;
+
+    std::deque <ptx_instruction*> m_branchDeQ;
+    std::deque <addr_t> m_branchTargetDeQ;
+    std::deque <const char*> m_regsNotRenamedDeQ;
+
+    bool searchRegWrite(const char *name)
+    {  
+      std::map<const char*, operand_info*>::iterator wrMapIter;
+      wrMapIter = m_regWriteMap.find(name);
+      if(wrMapIter == m_regWriteMap.end()) 
+        return false;
+      else
+        return true;
+    }
+    
+    bool searchRegLifetime(const char *name)
+    {  
+        std::map<const char*, operand_info*>::iterator it;
+        it = m_regLifetimeMap.find(name);
+        if(it == m_regLifetimeMap.end())
+          return false;
+        else
+          return true;
+    }  
+
+    void categorizeRegs(addr_t lastPc)
+    {
+   	  m_regsNotRenamedDeQ.clear();
+	    int i = 0;
+	    int maxAccess = 0;
+	    float threshold = (float)lastPc;
+   	  for( std::map<const char*, int>::iterator it = m_regAccessFreqMap.begin();
+		          it!= m_regAccessFreqMap.end(); ++it, i++)
+	    {
+			  int firstWrite;
+        std::map<const char*, operand_info*>::iterator lifetimeMapIter;
+		    lifetimeMapIter = m_regLifetimeMap.find(it->first);
+        
+        std::map<const char*, operand_info*>::iterator writeMapIter;
+		    writeMapIter = m_regFirstWriteMap.find(it->first);
+        if(writeMapIter == m_regFirstWriteMap.end())
+          firstWrite = 0;
+        else
+          firstWrite = writeMapIter->second->m_PC;
+			
+        if(((float)(lifetimeMapIter->second->m_PC)-(float)firstWrite) > threshold)
+          m_regsNotRenamedDeQ.push_back(it->first);   //  Never Renamed
+
+        if(maxAccess < it->second)
+          maxAccess = it->second;
+	    }
+
+	    threshold = (float)maxAccess;
+   	  for( std::map<const char*, int>::iterator it = m_regAccessFreqMap.begin();
+		          it!= m_regAccessFreqMap.end(); ++it)
+      {
+        if((float)(it->second) > threshold)
+          m_regsNotRenamedDeQ.push_back(it->first);   //  Never Renamed
+      }
+    }
+  
+    void summarizeRegLifetime(addr_t lastPc)
+    {
+      FILE *fp = fopen("_Lifetime_Analysis_", "a");
+      fprintf(fp, "\n\n\n\n");
+      fprintf(fp, "Write \n");
+      for (auto t = m_regWriteMap.cbegin(); t != m_regWriteMap.cend(); ++t)
+      {
+        fprintf(fp, "reg-%s], @ pc %d\t\t", t->first, t->second->m_PC);
+        std::map <const char*, operand_info*>::iterator ltIter;
+        ltIter = m_regLifetimeMap.find(t->first);
+        if (ltIter != m_regLifetimeMap.end())
+          fprintf(fp, "LT reg-%s] @ pc %d\n", ltIter->first, ltIter->second->m_PC);
+        else
+          fprintf(fp, "LT not found - Error\n");
+      }
+
+      fprintf(fp, "\n\nLifetime \n");
+      for (auto t = m_regLifetimeMap.cbegin(); t != m_regLifetimeMap.cend(); ++t)
+        fprintf(fp, "reg-%s], @ pc %d\n", t->first, t->second->m_PC);
+      
+
+      fflush(fp);
+
+      fprintf(stderr, "Started Summarize\n");
+      for( std::map<const char*, operand_info*>::iterator it = m_regLifetimeMap.begin();
+            it!= m_regLifetimeMap.end(); ++it)
+      {
+          it->second->set_last_read();
+          fprintf(fp, "%s] %x\n", it->first, it->second->m_PC);
+      }
+      // branchLifetime();
+      // categorizeRegs(lastPc);
+      fprintf(stderr, "DOne with Summarize\n");
+      fclose(fp);
+    }
+
+    bool isRegModifiedByBranch 
+      ( std::map <const char*, operand_info*>::iterator ltMapIter)
+    {
+      bool regModifiedFlag = false;
+      ptx_instruction *branchI;
+      ptx_instruction *prevBranchI = NULL;
+      addr_t prevBranchTarget = 0;
+      addr_t branchTarget = 0;
+
+      for (int i = 0; i < m_branchDeQ.size(); ++i)
+      {
+        branchI = m_branchDeQ[i];               //  pc+8
+        branchTarget = m_branchTargetDeQ[i];  //  target
+
+        //  Last read before branch
+        if ( ltMapIter->second->m_PC < branchI->get_PC() - branchI->inst_size() )
+        {
+          std::map <const char*, operand_info*>::iterator wrMapIter;
+          wrMapIter = m_regWriteMap.find(ltMapIter->first);
+          assert(wrMapIter->second);
+
+          //  If lastWr before loop body & before lastRead and
+          //  lastRead inside loop - maybe dead after loop
+          if ((wrMapIter->second->m_PC < branchTarget) &&
+              (wrMapIter->second->m_PC < ltMapIter->second->m_PC) &&
+              (ltMapIter->second->m_PC > branchTarget)) 
+          {  
+            if (prevBranchI != NULL && 
+                (prevBranchI->get_PC() < branchI->get_PC()) &&
+                prevBranchTarget > branchTarget )
+              prevBranchI->searchRemoveDeadReg(ltMapIter->first);
+            else
+              ltMapIter->second->reset_last_read();
+
+            branchI->addDeadReg(ltMapIter->first);
+            branchI->m_reg_update = true;
+            prevBranchI = branchI;
+            // prevBranchTarget = branchTarget;
+            regModifiedFlag = true;
+          }
+        }
+      }
+      return regModifiedFlag;
+    }
+
+    void branchLifetime()
+    {
+      ptx_instruction *branchI;
+      ptx_instruction *prevBranchI = NULL;
+      addr_t branchTarget = 0;
+      addr_t prevBranchTarget = 0;
+
+      FILE *fp = fopen("_Lifetime_Analysis_", "a");
+      fprintf(fp, "\n\n\n\n");
+
+      for (std::map <const char*, operand_info*>::iterator ltMapIter = m_regLifetimeMap.begin();
+        ltMapIter != m_regLifetimeMap.end(); ++ltMapIter)
+      {
+        for (int i = 0; i < m_branchDeQ.size(); ++i)
+        {
+          branchI = m_branchDeQ[i];
+          branchTarget = m_branchTargetDeQ[i];
+        
+          if ( ltMapIter->second->m_PC < (branchI->get_PC() - branchI->inst_size()) )
+          {
+            std::map <const char*, operand_info*>::iterator wrMapIter;
+            wrMapIter = m_regWriteMap.find(ltMapIter->first);
+            fprintf(fp, "iter-%s] %x\n", ltMapIter->first, branchI->get_PC());
+            assert(wrMapIter->second);
+
+            if ( wrMapIter->second->m_PC < branchTarget &&          //  Written before Jump Target
+              wrMapIter->second->m_PC < ltMapIter->second->m_PC &&  //  Written before Read
+              ltMapIter->second->m_PC > branchTarget )              //  Read after target
+            {
+              if ( prevBranchI != NULL &&
+                prevBranchI->get_PC() < branchI->get_PC() &&
+                prevBranchTarget > branchTarget )
+              {
+                prevBranchI->searchRemoveDeadReg(ltMapIter->first);
+              }
+              else
+              {
+                ltMapIter->second->reset_last_read();
+              }
+              branchI->addDeadReg(ltMapIter->first);
+              branchI->m_reg_update = true;
+              prevBranchI = branchI;
+              //  prevBranchTarget = branchTarget;
+              fprintf(fp, "mod-%s] %x\n", ltMapIter->first, branchI->get_PC());
+            }
+          }
+        }
+      }
+      fclose(fp);
+    }
+
+  #endif
+
+
 };
 
 class arg_buffer_t {

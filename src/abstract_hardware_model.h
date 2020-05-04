@@ -965,6 +965,25 @@ class inst_t {
   memory_space_t space;
   cache_operator_type cache_op;
 
+  bool m_bbStartFlag;
+  int m_bbRegReleaseCount;
+  void* m_bbFirstInst;
+  int m_bbOffset;
+  #define BB_ReleaseMaskSize 48//3x16
+	typedef std::bitset<BB_ReleaseMaskSize> m_releaseMask_t;
+	m_releaseMask_t m_bbReleaseMask;
+
+  #ifndef VirtualRegisterFile
+    #define REG_ARCH_NAME_SIZE 16
+    typedef struct
+    {
+      char src[MAX_REG_OPERANDS][REG_ARCH_NAME_SIZE];
+      char dst[MAX_REG_OPERANDS][REG_ARCH_NAME_SIZE];
+    } reg_archNames_t;
+
+    reg_archNames_t reg_archNames;
+  #endif
+
  protected:
   bool m_decoded;
   virtual void pre_decode() {}

@@ -145,6 +145,12 @@ void ptx_warp_info::reset_done_threads() { m_done_threads = 0; }
 
 ptx_thread_info::~ptx_thread_info() {
   m_gpu->gpgpu_ctx->func_sim->g_ptx_thread_info_delete_count++;
+  #ifdef VirtualRegisterFile
+    for (std::map<const char*, regUsageStats_t>::iterator it 
+          = m_regUsageStatsMap.begin(); it != m_regUsageStatsMap.end(); ++it)
+          free(it->second);
+    m_regUsageStatsMap.clear();
+  #endif
 }
 
 ptx_thread_info::ptx_thread_info(kernel_info_t &kernel) : m_kernel(kernel) {
@@ -615,3 +621,200 @@ void feature_not_implemented(const char *f) {
   printf("GPGPU-Sim: feature '%s' not supported\n", f);
   abort();
 }
+
+#ifndef VirtualRegisterFile
+
+  int ptx_thread_info::check_release( addr_t pc )
+  {
+    bool regReleaseFlag = false;
+    int regsToRelease = 0;
+
+    const ptx_instruction *pI = m_func_info->get_instruction(pc);
+
+    if (pI->m_operands.size() > 1) 
+    {
+      if (pI->src1().is_last_read())
+      {
+        regsToRelease++;
+      }
+    }
+   
+    if (pI->m_operands.size() > 2) 
+    {
+      if (pI->src2().is_last_read())
+      {
+        regsToRelease++;
+      }
+    } 
+    
+    if (pI->m_operands.size() > 3) 
+    {
+      if (pI->src3().is_last_read())
+      {
+        regsToRelease++;
+      }
+    }
+
+    return regsToRelease;
+  }
+
+  int ptx_thread_info::getRegDeadCount(const class inst_t *inst)
+  {
+    addr_t pc = next_instr();
+    //assert( pc == inst->pc ); // check timing and functional model in sync
+    if(pc != inst->pc)
+        return true;
+    const ptx_instruction *pI = m_func_info->get_instruction(pc);
+    
+    return pI->m_dead_regs.size();
+  }
+
+  void ptx_thread_info::addRegStats(const char *name, bool isRead)
+  {  
+    regUsageStats_t *t = (regUsageStats_t*)malloc(sizeof(regUsageStats_t));
+    memset(t, 0, sizeof(regUsageStats_t));
+    if(!isRead)
+    { 
+      t->totalAccess = 0;
+
+      t->modified = true;
+      t->lastWrite = m_gpu->gpu_sim_cycle;
+      t->numAccess = 0;
+      t->lastOp = regWrite;
+      t->state = live;
+    }
+    else
+    {
+      t->modified = false;
+      t->lastRead = m_gpu->gpu_sim_cycle;
+      t->lastWrite = 0;
+      t->lastOp = regRead;
+      t->numAccess = 1;
+      t->state = live;
+    }
+    t->firstAccess = m_gpu->gpu_sim_cycle;
+
+    std::pair<std::map<const char*,regUsageStats_t*>::iterator,bool> ret;
+    ret = m_regUsageStatsMap.insert(std::pair<const char*,regUsageStats_t*>(name, t));
+    if(ret.second == false)
+    {
+      printf("err: %s is already exist\n", name);
+    }
+  }
+
+  bool ptx_thread_info::findRegStats(const char *name)
+  {
+    std::map<const char*,regUsageStats_t*>::iterator it;
+    it = m_regUsageStatsMap.find(name);
+    if(it == m_regUsageStatsMap.end()) 
+      return false;
+    return true;
+  }
+
+  void ptx_thread_info::checkRegDead(const ptx_instruction *pI)
+  {
+    if(pI->m_reg_update)
+    {
+      for(int i = 0; i < pI->m_dead_regs.size(); i++)
+      {
+        updateRegStats(pI->m_dead_regs[i], true, true, pI);
+      }
+    }
+  }
+
+
+  void ptx_thread_info::updateRegStats(const char *name, bool isRead, 
+      bool isLastRead, const ptx_instruction* pI)
+  {
+    if(findRegStats(name))
+    {
+      std::map<const char*,regUsageStats_t*>::iterator it;
+      it = m_regUsageStatsMap.find(name);
+      regUsageStats_t *stats = it->second;
+
+      if(isRead)
+      {
+        stats->lastRead = m_gpu->gpu_sim_cycle;
+        stats->lastOp = regRead;
+        stats->numAccess++;
+        if(isLastRead && isRead && 
+          ((pI->reconvergence_pc == ((address_type)-1)) ||    //  Not a branch 
+           (pI->reconvergence_pc == ((address_type)-2))) )    //  Reconv on return
+        {
+          ((shader_core_ctx*)m_core)->renameReg(m_hw_ctaid, m_hw_wid, name, 
+            dead, stats->numAccess);
+          stats->state = dead;
+        }
+      }
+      else
+      {
+        stats->lastWrite = m_gpu->gpu_sim_cycle;
+        stats->totalAccess += stats->numAccess;
+        stats->numAccess = 0;
+        stats->lastOp = regWrite;
+        #ifndef MULT_RF
+          ((shader_core_ctx*)m_core)->renameReg(m_hw_ctaid, m_hw_wid, name, 
+            live, 0);
+          stats->state = live;
+        #endif
+
+      }
+    }
+    else
+    {
+      addRegStats(name, isRead);
+      std::map<const char*,regUsageStats_t*>::iterator it;
+      it = m_regUsageStatsMap.find(name);
+      regUsageStats_t *stats = it->second;
+      #ifndef MULT_RF
+        ((shader_core_ctx*)m_core)->renameReg(m_hw_ctaid, m_hw_wid, name, live, 0);
+        stats->state = live;
+      #endif
+    }
+  }
+
+  bool ptx_thread_info::isRegReady(const class inst_t *inst)
+  {
+    addr_t pc = next_instr();
+    //assert( pc == inst->pc ); // make sure timing model and functional model are in sync
+    if(pc != inst->pc)
+        return true;
+    const ptx_instruction *pI = m_func_info->get_instruction(pc);
+
+    bool ready = true;
+    if(pI->m_operands.size()>1)
+    {
+        const operand_info &src1 = pI->src1();
+        if(src1.is_reg()) ready = isRegReady(src1.get_symbol()->name().c_str(), pc);
+    }
+    if(pI->m_operands.size()>2 && ready)
+    {
+        const operand_info &src2 = pI->src2();
+        if(src2.is_reg()) ready = isRegReady(src2.get_symbol()->name().c_str(), pc);
+    }
+    if(pI->m_operands.size()>3 && ready)
+    {
+        const operand_info &src3 = pI->src3();
+        if(src3.is_reg()) ready = isRegReady(src3.get_symbol()->name().c_str(), pc);
+    }
+
+    return ready;
+  }
+
+  bool ptx_thread_info::isRegReady(const char *name, addr_t pc)
+  {
+    bool ready = true;
+    if(findRegStats(name))
+    {
+        std::map<const char*,regUsageStats_t*>::iterator it;
+        it = m_regUsageStatsMap.find(name);
+        regUsageStats_t *t = it->second;
+        if((t->state == dead))
+        {
+          ready = false;
+        }
+    }
+    return ready;
+  }
+
+#endif
