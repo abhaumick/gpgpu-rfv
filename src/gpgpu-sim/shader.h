@@ -2212,7 +2212,7 @@ class shader_core_ctx : public core_t {
 
     std::deque <physical_reg_subarray_info_t*> physical_reg_subarray_info;
 
-    unsigned m_regs_per_subarray;
+    unsigned m_regs_per_subarray; // num registers per physical register slice;
     unsigned *m_phys_regs_count_per_cta;
 
     void renameReg (int cta_id, int warp_id, const char* name, 
@@ -2229,13 +2229,19 @@ class shader_core_ctx : public core_t {
 
     unsigned long long m_phys_reg_count;
     unsigned long long m_arch_reg_count;
-    unsigned long long m_phys_subarray_usage[16]; //  Max subarray assumed 16
+    #define SUBARRAY_COUNT 4
+    #define SUBARRAY_MAX 16
+    unsigned long long m_phys_subarray_usage[SUBARRAY_MAX]; //  Max subarray assumed 16
     unsigned m_phys_reg_max;
     unsigned long long m_last_rename_stat_cycle;
 
     void updateRegRenameStats();
     void updateRegRenameStatsByCycle(unsigned long long cycle);
 
+    bool isPhysRegsFull(int regMargin);
+    void checkRenameDeadlock();
+    
+    int *m_urgent_cta;
   #endif
 
  private:

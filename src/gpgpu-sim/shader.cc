@@ -430,6 +430,8 @@ shader_core_ctx::shader_core_ctx(class gpgpu_sim *gpu,
 
   #ifndef VirtualRegisterFile
 
+    m_urgent_cta = (int*) calloc(m_config->max_cta_per_core, sizeof(int));
+
     m_regs_per_subarray = m_config->gpgpu_shader_physical_registers
       / (m_config->gpgpu_shader_num_subarrays * 32);  //  32 * #subarrays
 
@@ -640,15 +642,15 @@ void shader_core_stats::print(FILE *fout) const {
       gpu_stall_shd_mem_breakdown[G_MEM_LD][COAL_STALL] +
           gpu_stall_shd_mem_breakdown[G_MEM_ST][COAL_STALL] +
           gpu_stall_shd_mem_breakdown[L_MEM_LD][COAL_STALL] +
-          gpu_stall_shd_mem_breakdown[L_MEM_ST]
-                                     [COAL_STALL]);  // coalescing stall + bank
+          gpu_stall_shd_mem_breakdown[L_MEM_ST][COAL_STALL]);  
+                                                     // coalescing stall + bank
                                                      // conflict at data cache
   fprintf(fout, "gpgpu_stall_shd_mem[gl_mem][data_port_stall] = %d\n",
           gpu_stall_shd_mem_breakdown[G_MEM_LD][DATA_PORT_STALL] +
               gpu_stall_shd_mem_breakdown[G_MEM_ST][DATA_PORT_STALL] +
               gpu_stall_shd_mem_breakdown[L_MEM_LD][DATA_PORT_STALL] +
-              gpu_stall_shd_mem_breakdown[L_MEM_ST]
-                                         [DATA_PORT_STALL]);  // data port stall
+              gpu_stall_shd_mem_breakdown[L_MEM_ST][DATA_PORT_STALL]);  
+                                                              // data port stall
                                                               // at data cache
   // fprintf(fout, "gpgpu_stall_shd_mem[g_mem_ld][mshr_rc] = %d\n",
   // gpu_stall_shd_mem_breakdown[G_MEM_LD][MSHR_RC_FAIL]); fprintf(fout,
@@ -3254,6 +3256,9 @@ void shader_core_ctx::cycle() {
   if (!isactive() && get_not_completed() == 0) return;
 
   m_stats->shader_cycles[m_sid]++;
+  #ifndef VirtualRegisterFile
+    checkRenameDeadlock();
+  #endif
   writeback();
   execute();
   read_operands();
@@ -4420,8 +4425,8 @@ void shader_core_ctx::checkExecutionStatusAndUpdate(warp_inst_t &inst,
 
   void shader_core_ctx::renameReg (const char* archRegName, unsigned long long cycle)
   {
-    int slice = 0;
-    physical_reg_t* physReg = m_phyRegFile[slice].front();
+    int subarrayIdx = 0;
+    physical_reg_t* physReg = m_phyRegFile[subarrayIdx].front();
     physReg->isValid = true;
     physReg->state = true;
 
@@ -4431,7 +4436,7 @@ void shader_core_ctx::checkExecutionStatusAndUpdate(warp_inst_t &inst,
     );
     // assert (mapInsertRetVal.second != false);
 
-    m_phyRegFile[slice].erase(m_phyRegFile[slice].begin());
+    m_phyRegFile[subarrayIdx].erase(m_phyRegFile[subarrayIdx].begin());
     return;
   }
 
@@ -4481,45 +4486,153 @@ void shader_core_ctx::checkExecutionStatusAndUpdate(warp_inst_t &inst,
 	  return min_dead;
   }
 
+
+  void shader_core_ctx::updateRegRenameStatsByCycle(unsigned long long cycle)
+  {
+    if (cycle > m_last_rename_stat_cycle)
+    {
+      m_phys_reg_count = 0;
+      int *perSubarrayUsage = (int*)calloc(SUBARRAY_COUNT, sizeof(int)); 
+      for (std::map <const char*, physical_reg_t*>::iterator a2pMapIter = 
+        m_arch2phy_map.begin(); a2pMapIter != m_arch2phy_map.end(); a2pMapIter++)
+      {
+        ++m_phys_reg_count;
+        int subarrayIdx = a2pMapIter->second->number / m_regs_per_subarray;
+        if (subarrayIdx < SUBARRAY_COUNT)
+          perSubarrayUsage[subarrayIdx] += 1;
+      }
+      m_phys_reg_max = MAX(m_phys_reg_count, m_phys_reg_max);
+
+      for (int i = 0; i < SUBARRAY_COUNT; i++)
+      {
+        if (perSubarrayUsage[i] > 0)
+          m_phys_subarray_usage[i] += 1;
+      }
+      updateRegRenameStats();
+    }
+  }
+
   void shader_core_ctx::updateRegRenameStats()
   {
-    int isAnySubarrayUsed = false;
+    bool hasSubarrayUsage = false;
+    int idx = 0;
     for (int i = 0; i < m_config->gpgpu_shader_num_subarrays; ++i)
     {
-      m_gpu->m_phys_subarray_usage[m_sid * m_config->gpgpu_shader_num_subarrays + i] =
-        m_phys_subarray_usage[i];
+      idx = m_sid * m_config->gpgpu_shader_num_subarrays + i;
+      m_gpu->m_phys_subarray_usage[idx] = m_phys_subarray_usage[i];
       if (m_phys_subarray_usage[i] > 0)
-        isAnySubarrayUsed = true;
+        hasSubarrayUsage = true;
     }
 
-    if (isAnySubarrayUsed)
+    if (hasSubarrayUsage)
     {
+      //  Add up Phys Reg Stats
       m_gpu->m_phys_reg_count[m_sid] += m_phys_reg_count;
-      m_gpu->m_phys_reg_max[m_sid] = MAX( m_phys_reg_max, m_gpu->m_phys_reg_max[m_sid]);
-      m_gpu->m_checked_cycles[m_sid]++;
+      m_gpu->m_phys_reg_max[m_sid] = MAX( m_phys_reg_count, m_gpu->m_phys_reg_max[m_sid] );
+      m_gpu->m_checked_cycles[m_sid] ++;
 
+      //  Add up Arch Reg Stats
       unsigned long long archRegCount = 0;
-      for (int i = 0; i < m_config->n_thread_per_shader; i += 32)
+      for (int i = 0; i < m_config->n_thread_per_shader; i+=32)
       {
         if (m_thread[i])
           archRegCount += m_thread[i]->m_regUsageStatsMap.size();
       }
 
-      m_gpu->m_arch_reg_max[m_sid] = MAX(archRegCount, m_gpu->m_arch_reg_max[m_sid]);
+    m_gpu->m_arch_reg_max[m_sid] = MAX(archRegCount, m_gpu->m_arch_reg_max[m_sid]);
 
-      m_gpu->m_arch_subarray_usage[m_sid] += (archRegCount / m_regs_per_subarray + 1);
-      m_arch_reg_count = MAX(archRegCount, m_arch_reg_count);
-      m_gpu->m_arch_reg_count[m_sid] += m_arch_reg_count;
-      m_phys_reg_count = 0;
+    m_gpu->m_arch_subarray_usage[m_sid] += (archRegCount / m_regs_per_subarray + 1);
+    m_arch_reg_count = MAX(archRegCount, m_arch_reg_count);
+    m_gpu->m_arch_reg_count[m_sid] += m_arch_reg_count;
+    m_phys_reg_count = 0;
     }
+    
   }
 
-    void shader_core_ctx::updateRegRenameStatsByCycle(unsigned long long cycle)
+    void shader_core_ctx::checkRenameDeadlock()
     {
-      if (cycle > m_last_rename_stat_cycle)
+      if (m_regs_per_cta > 0)
+        isPhysRegsFull(m_regs_per_cta);
+    }
+
+    bool shader_core_ctx::isPhysRegsFull(int regMargin)
+    {
+      int totalRegsInUse = 0;
+      int totalActiveCTAs = 0;
+
+      for (auto i = 0; i < m_phyRegFile.size(); ++i)
+        totalRegsInUse += (m_regs_per_subarray - m_phyRegFile[i].size());
+
+      for (int i = 0; i < kernel_max_cta_per_shader; ++i)
       {
-        ;
+        if (m_cta_status[i] > 0)
+          ++totalActiveCTAs;
       }
+
+      int freeRegsCount = 
+        m_config->gpgpu_shader_physical_registers / 32 - totalRegsInUse;
+      int extraRegsInUse = 
+        (totalActiveCTAs / m_config->kernel_cta_throttle_count)
+        * (regMargin + m_config->kernel_register_file_margin);
+      
+      int *urgentCTA        = (int*) malloc(m_config->max_cta_per_core * sizeof(int));
+      int *urgentCTAbyRegs  = (int*) malloc(m_config->max_cta_per_core * sizeof(int));
+
+      for (int i = 0; i < m_config->max_cta_per_core; ++i)
+      {
+        urgentCTA[i] = -1;
+        urgentCTAbyRegs[i] = -1;
+      }
+      
+
+      if (freeRegsCount < extraRegsInUse)
+      {
+        int totalIters = 0;
+        //  Sort by register demand
+        for (int j = 0; j < totalActiveCTAs / m_config->kernel_cta_throttle_count; ++j )
+        {
+          for (int i = 0; i < kernel_max_cta_per_shader; ++i)
+          {
+            if (m_cta_status[i] > 0)
+            {
+              int k = 0;
+              for (k = 0; k < j; ++k)
+              {
+                if (urgentCTA[j] == i)
+                  break;
+              }
+
+              if (k == j)
+              {
+                if (urgentCTAbyRegs[j] < m_phys_regs_count_per_cta[i])
+                {
+                  urgentCTAbyRegs[j] = m_phys_regs_count_per_cta[i];
+                  urgentCTA[j] = i;
+                }
+              }
+            }
+          }
+          m_urgent_cta[j] = urgentCTA[j];
+          totalIters = j;
+        }
+
+        //  Remvoe from urgent if capacity overflow
+        for (int j = totalIters; j > 0; --j)
+        {
+          int runningSumOfRegs = 0;
+          for (int k = 0; k <= j; ++k)
+          {
+            runningSumOfRegs += urgentCTAbyRegs[k];
+          }
+          
+          if (runningSumOfRegs + freeRegsCount 
+            < (j+1) * (regMargin + m_config->kernel_register_file_margin))
+          {
+            m_urgent_cta[j] = -1;
+          }
+        }
+      }
+      return false;
     }
 
 
