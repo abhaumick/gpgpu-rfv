@@ -1436,6 +1436,10 @@ class shader_core_config : public core_config {
   }
   void set_pipeline_latency();
 
+  #ifndef VirtualRegisterFile
+    unsigned num_regs_per_thread( const kernel_info_t &k) const;
+  #endif
+
   // backward pointer
   class gpgpu_context *gpgpu_ctx;
   // data
@@ -1503,6 +1507,12 @@ class shader_core_config : public core_config {
 
   // Shader core resources
   unsigned gpgpu_shader_registers;
+  #ifndef VirtualRegisterFile
+    unsigned gpgpu_shader_physical_registers;
+    unsigned gpgpu_shader_num_subarrays;
+    unsigned kernel_register_file_margin;
+    unsigned kernel_cta_throttle_count;
+  #endif
   int gpgpu_warpdistro_shader;
   int gpgpu_warp_issue_shader;
   unsigned gpgpu_num_reg_banks;
@@ -1570,6 +1580,9 @@ struct shader_core_stats_pod {
   unsigned *m_num_sfu_committed;
   unsigned *m_num_tensor_core_committed;
   unsigned *m_num_mem_committed;
+  #ifndef VirtualRegisterFile
+    unsigned gpu_reg_rename_table_access;
+  #endif
   unsigned *m_read_regfile_acesses;
   unsigned *m_write_regfile_acesses;
   unsigned *m_non_rf_operands;
@@ -1810,6 +1823,7 @@ class shader_core_ctx : public core_t {
                   unsigned shader_id, unsigned tpc_id,
                   const shader_core_config *config,
                   const memory_config *mem_config, shader_core_stats *stats);
+  ~shader_core_ctx();
 
   // used by simt_core_cluster:
   // modifiers
@@ -2154,6 +2168,11 @@ class shader_core_ctx : public core_t {
   // run on this shader, where the warp_id is the static warp slot.
   unsigned m_dynamic_warp_id;
 
+  #ifndef VirtualRegisterFile
+    unsigned m_regs_per_cta;
+    unsigned m_regs_per_thread;
+  #endif
+
   // Jin: concurrent kernels on a sm
  public:
   bool can_issue_1block(kernel_info_t &kernel);
@@ -2162,8 +2181,61 @@ class shader_core_ctx : public core_t {
   int find_available_hwtid(unsigned int cta_size, bool occupy);
 
   #ifndef VirtualRegisterFile
-    void renameReg (int cta_id, int warp_id, const char* name, int stat, 
-      unsigned long long cnt);
+    typedef struct
+    {
+      int number;
+      bool state;
+      bool isValid;
+      unsigned long long count;
+    } physical_reg_t;
+
+    struct stringCompare
+	  {
+   		bool operator()(char const *a, char const *b)
+   		{
+      		return strcmp(a, b) < 0;
+   		}
+	  };
+
+    std::map <const char*, physical_reg_t*, stringCompare> m_arch2phy_map;
+
+    typedef std::deque <physical_reg_t*> physical_reg_subarray_t;
+    typedef std::deque <physical_reg_subarray_t> physical_reg_file_t;
+    physical_reg_file_t m_phyRegFile;
+
+    typedef struct
+    {
+      unsigned idx;
+      int state; 							// 0: off 1: off->on(on wakeup) 2: on
+      unsigned long long lastUseTime; // time after turned on/off (for checking wakeup delay)	
+    } physical_reg_subarray_info_t;
+
+    std::deque <physical_reg_subarray_info_t*> physical_reg_subarray_info;
+
+    unsigned m_regs_per_subarray;
+    unsigned *m_phys_regs_count_per_cta;
+
+    void renameReg (int cta_id, int warp_id, const char* name, 
+      int state, unsigned long long cnt);
+    void renameReg (const char* archRegName, unsigned long long cycle);
+
+    void releaseReg (const char* archReg, unsigned long long useCount);
+
+    int getSubarray( int regNum );
+    int findPhysReg(char* regName);
+    bool checkRegName(int warp_id, const char* name);
+    bool checkRegState(int warp_id, const warp_inst_t* warp_inst);
+    int getRegDeadCount(int warp_id, warp_inst_t* warp_inst);
+
+    unsigned long long m_phys_reg_count;
+    unsigned long long m_arch_reg_count;
+    unsigned long long m_phys_subarray_usage[16]; //  Max subarray assumed 16
+    unsigned m_phys_reg_max;
+    unsigned long long m_last_rename_stat_cycle;
+
+    void updateRegRenameStats();
+    void updateRegRenameStatsByCycle(unsigned long long cycle);
+
   #endif
 
  private:

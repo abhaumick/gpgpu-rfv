@@ -74,6 +74,20 @@ std::list<unsigned> shader_core_ctx::get_regs_written(const inst_t &fvt) const {
   return result;
 }
 
+shader_core_ctx::~shader_core_ctx(void)
+{
+  #ifndef VirtualRegisterFile
+    for(std::map <const char*, physical_reg_t*>::iterator a2pMapIter = m_arch2phy_map.begin();
+      a2pMapIter != m_arch2phy_map.end(); ++a2pMapIter)
+      {
+        free((void*)a2pMapIter->first);
+        free((void*)a2pMapIter->second);
+      }
+      m_arch2phy_map.clear();
+      m_phyRegFile.clear();
+  #endif
+}
+
 shader_core_ctx::shader_core_ctx(class gpgpu_sim *gpu,
                                  class simt_core_cluster *cluster,
                                  unsigned shader_id, unsigned tpc_id,
@@ -413,6 +427,48 @@ shader_core_ctx::shader_core_ctx(class gpgpu_sim *gpu,
   m_occupied_ctas = 0;
   m_occupied_hwtid.reset();
   m_occupied_cta_to_hwtid.clear();
+
+  #ifndef VirtualRegisterFile
+
+    m_regs_per_subarray = m_config->gpgpu_shader_physical_registers
+      / (m_config->gpgpu_shader_num_subarrays * 32);  //  32 * #subarrays
+
+    //  Populate subarrays
+    for(int i = 0; i < m_config->gpgpu_shader_num_subarrays; i++)
+	  {
+		  physical_reg_subarray_t subarray;
+		  for(int j = 0; j < m_regs_per_subarray; j++)
+		  {
+			  physical_reg_t* p = (physical_reg_t*) malloc(sizeof(physical_reg_t));
+			  p->number = i * m_regs_per_subarray + j;
+			  p->isValid = false;
+			  p->state = true; // default state is slr;
+			  p->count = 0;
+			  subarray.push_back(p);
+	  	}
+		  m_phyRegFile.push_back(subarray);
+		  //printf("subarray:%d %d %d\n", i, subarray.size(), m_phys_reg_list[i].size());
+	  }
+
+    m_phys_reg_count = 0;
+    m_phys_reg_max = 0;
+    m_arch_reg_count = 0;
+
+    //  Init SubarrayInfo
+    for (int i = 0; i < m_config->gpgpu_shader_num_subarrays; i++)
+    {
+      physical_reg_subarray_info.push_back(
+        (physical_reg_subarray_info_t*) malloc(sizeof(physical_reg_subarray_info_t))
+        );
+      physical_reg_subarray_info[i]->idx = i;
+      physical_reg_subarray_info[i]->state = 0;
+      physical_reg_subarray_info[i]->lastUseTime = 0;
+    }
+
+    m_regs_per_cta = 0;
+    m_phys_regs_count_per_cta = (unsigned int*) calloc(m_config->max_cta_per_core, sizeof(unsigned int));
+  
+  #endif
 }
 
 void shader_core_ctx::reinit(unsigned start_thread, unsigned end_thread,
@@ -629,6 +685,12 @@ void shader_core_stats::print(FILE *fout) const {
 
   fprintf(fout, "gpu_reg_bank_conflict_stalls = %d\n",
           gpu_reg_bank_conflict_stalls);
+
+  #ifndef VirtualRegisterFile
+	  fprintf(fout, "gpu_reg_rename_table_access = %d\n", gpu_reg_rename_table_access);
+	  fprintf(fout, "gpu_reg_read_access = %d\n", m_read_regfile_acesses);
+	  fprintf(fout, "gpu_reg_write_access = %d\n",m_write_regfile_acesses);
+  #endif
 
   fprintf(fout, "Warp Occupancy Distribution:\n");
   fprintf(fout, "Stall:%d\t", shader_cycle_distro[2]);
@@ -896,6 +958,9 @@ void shader_core_ctx::fetch() {
 }
 
 void shader_core_ctx::func_exec_inst(warp_inst_t &inst) {
+  #ifndef VirtualRegisterFile
+    updateRegRenameStatsByCycle(m_gpu->gpu_sim_cycle);
+  #endif
   execute_warp_inst_t(inst);
   if (inst.is_load() || inst.is_store()) {
     inst.generate_mem_accesses();
@@ -3020,6 +3085,15 @@ void shader_core_ctx::display_pipeline(FILE *fout, int print_mem,
   }
 }
 
+  #ifndef VirtualRegisterFile
+    unsigned int shader_core_config::num_regs_per_thread( const kernel_info_t &k ) const
+    {
+      const class function_info *kernel = k.entry();
+      const struct gpgpu_ptx_sim_info *kernel_info = kernel->get_kernel_info();
+      return kernel_info->regs;
+    }
+  #endif
+
 unsigned int shader_core_config::max_cta(const kernel_info_t &k) const {
   unsigned threads_per_cta = k.threads_per_cta();
   const class function_info *kernel = k.entry();
@@ -3454,6 +3528,24 @@ void shader_core_ctx::warp_exit(unsigned warp_id) {
 
     if (m_thread[i] && !m_thread[i]->is_done()) done = false;
   }
+
+  #ifndef VirtualRegisterFile
+    unsigned cta_id = m_warp[warp_id].get_cta_id();
+    std::deque <const char*> regsToRelease;
+    int warpIdx;
+    char regIdx[16];
+    for (std::map <const char*, physical_reg_t*>::iterator a2pMapIter = m_arch2phy_map.begin();
+      a2pMapIter != m_arch2phy_map.end(); ++a2pMapIter)
+    {
+      sscanf( a2pMapIter->first, "%d_%s", &warpIdx, regIdx );
+      if (warpIdx == warp_id)
+      {
+        releaseReg((char*)a2pMapIter->first, 0);
+        --(m_phys_regs_count_per_cta[cta_id]);
+      }
+    }
+  #endif
+  
   // if (m_warp[warp_id].get_n_completed() == get_config()->warp_size)
   // if (this->m_simt_stack[warp_id]->get_num_entries() == 0)
   if (done) m_barriers.warp_exit(warp_id);
@@ -4271,10 +4363,165 @@ void shader_core_ctx::checkExecutionStatusAndUpdate(warp_inst_t &inst,
 #ifndef VirtualRegisterFile
 
   void shader_core_ctx::renameReg (int cta_id, int warp_id, const char* name, 
-    int stat, unsigned long long cnt)
+    int state, unsigned long long cnt)
   {
+    assert( state == 0 || state == 1 );
+    //  ++ m_reg_rename_table_stats->gpgpu_reg_reanme_table_access;
+
+    //  Only release if reconvergence pc == -1 or -2 -> not diverged
+    char regFullName [32];
+    sprintf(regFullName, "%d_%s", warp_id, name);
+
+    std::map <const char*, physical_reg_t*>::iterator a2pMapIter;
+    
+    switch (state)
+    {
+    case 1:
+      a2pMapIter = m_arch2phy_map.find(regFullName);
+      if (a2pMapIter != m_arch2phy_map.end())
+        a2pMapIter->second->state = true;
+      else
+      {
+        releaseReg(regFullName, m_gpu->gpu_sim_cycle);
+        ++(m_phys_regs_count_per_cta[cta_id]);
+      }
+      break;
+
+    case 0:
+      a2pMapIter = m_arch2phy_map.find(regFullName);
+      if (a2pMapIter != m_arch2phy_map.end())
+      {
+        releaseReg(regFullName, cnt);
+        --(m_phys_regs_count_per_cta[cta_id]);
+      }
+      break;
+    
+    default:
+      break;
+    }
+
+  }
+
+  int shader_core_ctx::getSubarray(int regNum)
+  {
+    return (int) (regNum /  m_regs_per_subarray);
+  }
+
+  int shader_core_ctx::findPhysReg(char* regName)
+  {
+    std::map <const char*, physical_reg_t*> :: iterator a2pMapIter;
+    a2pMapIter = m_arch2phy_map.find(regName);
+
+    if (a2pMapIter != m_arch2phy_map.end())
+      return a2pMapIter->second->number;
+    else 
+      return -1;
+  }
+
+  void shader_core_ctx::renameReg (const char* archRegName, unsigned long long cycle)
+  {
+    int slice = 0;
+    physical_reg_t* physReg = m_phyRegFile[slice].front();
+    physReg->isValid = true;
+    physReg->state = true;
+
+    std::pair <std::map<const char*, physical_reg_t*>::iterator, bool> mapInsertRetVal;
+    mapInsertRetVal = m_arch2phy_map.insert(
+      std::pair <const char*, physical_reg_t*> (archRegName, physReg)
+    );
+    // assert (mapInsertRetVal.second != false);
+
+    m_phyRegFile[slice].erase(m_phyRegFile[slice].begin());
     return;
   }
+
+  void shader_core_ctx::releaseReg(const char* arch_reg, unsigned long long cnt)
+	{
+		std::map <const char*, physical_reg_t*>::iterator a2pMapIter;
+		a2pMapIter = m_arch2phy_map.find(arch_reg);	
+		if (a2pMapIter != m_arch2phy_map.end())
+		{
+			physical_reg_t* p = a2pMapIter->second;
+			int aval = p->number / m_regs_per_subarray;	
+			p->count += cnt;
+			assert(aval != -1);
+			p->isValid = false;
+			m_phyRegFile[aval].push_front(p);
+			free((void*)a2pMapIter->first);
+			m_arch2phy_map.erase(a2pMapIter);	
+		}
+	}
+
+  bool shader_core_ctx::checkRegName(int warp_id, const char* name)
+  {
+    m_stats->gpu_reg_rename_table_access++;
+    char regName[32];
+    sprintf(regName, "%d_%s", warp_id, name);
+
+    if (findPhysReg(regName) != -1 )
+      return true;
+    else
+      return false;
+  }
+
+  int shader_core_ctx::getRegDeadCount(int warp_id, warp_inst_t* warp_inst)
+  {
+    int min_dead = 5;
+	  int dead = 0;
+	  for(unsigned int t = 0; t < m_config->warp_size; t++)
+	  {
+	  	int tid = warp_id * m_config->warp_size + t;	
+	  	if(m_thread[tid])
+	  	{
+	  		dead = m_thread[tid]->getRegDeadCount(warp_inst);
+	  		if(min_dead > dead)
+          min_dead = dead;
+	  	}
+	  }
+	  return min_dead;
+  }
+
+  void shader_core_ctx::updateRegRenameStats()
+  {
+    int isAnySubarrayUsed = false;
+    for (int i = 0; i < m_config->gpgpu_shader_num_subarrays; ++i)
+    {
+      m_gpu->m_phys_subarray_usage[m_sid * m_config->gpgpu_shader_num_subarrays + i] =
+        m_phys_subarray_usage[i];
+      if (m_phys_subarray_usage[i] > 0)
+        isAnySubarrayUsed = true;
+    }
+
+    if (isAnySubarrayUsed)
+    {
+      m_gpu->m_phys_reg_count[m_sid] += m_phys_reg_count;
+      m_gpu->m_phys_reg_max[m_sid] = MAX( m_phys_reg_max, m_gpu->m_phys_reg_max[m_sid]);
+      m_gpu->m_checked_cycles[m_sid]++;
+
+      unsigned long long archRegCount = 0;
+      for (int i = 0; i < m_config->n_thread_per_shader; i += 32)
+      {
+        if (m_thread[i])
+          archRegCount += m_thread[i]->m_regUsageStatsMap.size();
+      }
+
+      m_gpu->m_arch_reg_max[m_sid] = MAX(archRegCount, m_gpu->m_arch_reg_max[m_sid]);
+
+      m_gpu->m_arch_subarray_usage[m_sid] += (archRegCount / m_regs_per_subarray + 1);
+      m_arch_reg_count = MAX(archRegCount, m_arch_reg_count);
+      m_gpu->m_arch_reg_count[m_sid] += m_arch_reg_count;
+      m_phys_reg_count = 0;
+    }
+  }
+
+    void shader_core_ctx::updateRegRenameStatsByCycle(unsigned long long cycle)
+    {
+      if (cycle > m_last_rename_stat_cycle)
+      {
+        ;
+      }
+    }
+
 
 #endif
 

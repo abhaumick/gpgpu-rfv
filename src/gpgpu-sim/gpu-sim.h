@@ -660,6 +660,20 @@ class gpgpu_sim : public gpgpu_t {
   void change_cache_config(FuncCache cache_config);
   void set_cache_config(std::string kernel_name);
 
+  #ifndef VirtualRegisterFile
+    unsigned long long *m_phys_reg_count;
+    unsigned long long *m_phys_reg_max;
+    unsigned long long *m_arch_reg_count;
+    unsigned long long *m_arch_reg_max;
+    unsigned long long *m_phys_reg_per_cta;
+    unsigned m_total_core_count;
+
+    unsigned long long* m_arch_subarray_usage;
+	  unsigned long long* m_checked_cycles;
+	  unsigned long long* m_phys_subarray_usage;
+
+  #endif
+
   // Jin: functional simulation for CDP
  private:
   // set by stream operation every time a functoinal simulation is done

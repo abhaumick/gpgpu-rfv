@@ -218,6 +218,23 @@ void memory_config::reg_options(class OptionParser *opp) {
 }
 
 void shader_core_config::reg_options(class OptionParser *opp) {
+  #ifndef VirtualRegisterFile
+    option_parser_register(opp, "-gpgpu_shader_phys_registers", OPT_UINT32, &gpgpu_shader_physical_registers, 
+                 "Number of phys registers per shader core. Limits number of concurrent CTAs. (default 8192)",
+                 "8192");
+    option_parser_register(opp, "-gpgpu_shader_num_subarrays", OPT_UINT32, &gpgpu_shader_num_subarrays,
+                 "Number of register subarrays. (default 4)",
+                 "4");
+    option_parser_register(opp, "-kernel_rf_margin", OPT_UINT32, &kernel_register_file_margin, 
+                 "Number of regsiters per application that differs from sass reg count and actual used reg count. (default 0)",
+                 "0");
+    option_parser_register(opp, "-kernel_throttle_cta_cnt", OPT_UINT32, &kernel_cta_throttle_count, 
+                 "Number of regsiters per application that differs from sass reg count and actual used reg count. (default 0)",
+                 "1");
+
+    fprintf(stderr, "\n\n RegOptions DOne \n\n");
+  #endif
+  
   option_parser_register(opp, "-gpgpu_simd_model", OPT_INT32, &model,
                          "1 = post-dominator", "1");
   option_parser_register(
@@ -776,6 +793,8 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
                                              config.g_power_config_name);
 #endif
 
+  fprintf(stderr, " \n\n Inside Construc 0\n\n");
+  
   m_shader_stats = new shader_core_stats(m_shader_config);
   m_memory_stats = new memory_stats_t(m_config.num_shader(), m_shader_config,
                                       m_memory_config, this);
@@ -803,6 +822,10 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   partiton_replys_in_parallel = 0;
   partiton_replys_in_parallel_total = 0;
 
+  
+  fprintf(stderr, " \n\n Inside Construc 1\n\n");
+
+
   m_cluster = new simt_core_cluster *[m_shader_config->n_simt_clusters];
   for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
     m_cluster[i] =
@@ -825,6 +848,10 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
     }
   }
 
+  
+  fprintf(stderr, " \n\n Inside Construc 2 \n\n");
+
+
   icnt_wrapper_init();
   icnt_create(m_shader_config->n_simt_clusters,
               m_memory_config->m_n_mem_sub_partition);
@@ -845,6 +872,35 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   // Jin: functional simulation for CDP
   m_functional_sim = false;
   m_functional_sim_kernel = NULL;
+
+  #ifndef VirtualRegisterFile
+
+    fprintf(stderr, "\n\n In Constructor \n\n");
+
+    m_total_core_count = m_shader_config->n_simt_clusters
+      * m_shader_config->n_simt_cores_per_cluster;
+    
+    m_phys_reg_count = (unsigned long long*) 
+      calloc(m_total_core_count, sizeof(unsigned long long));
+    m_phys_reg_max = (unsigned long long*)
+      calloc(m_total_core_count, sizeof(unsigned long long));
+    m_arch_reg_count = (unsigned long long*) 
+      calloc(m_total_core_count, sizeof(unsigned long long));
+    m_arch_reg_max = (unsigned long long*)
+      calloc(m_total_core_count, sizeof(unsigned long long));
+    
+    m_arch_subarray_usage = (unsigned long long *)
+      calloc(m_total_core_count, sizeof(unsigned long long));
+	  m_checked_cycles = (unsigned long long*)
+      calloc(m_total_core_count, sizeof(unsigned long long));
+	  m_phys_subarray_usage = (unsigned long long*)
+      calloc(m_total_core_count * m_shader_config->gpgpu_shader_num_subarrays, 
+      sizeof(unsigned long long));
+
+  #endif
+
+  fprintf(stderr, "\n\n GPU SIM COntructor DOne\n\n");
+
 }
 
 int gpgpu_sim::shared_mem_size() const {
@@ -1206,6 +1262,41 @@ void gpgpu_sim::gpu_print_stat() {
   fprintf(statfout, "max_total_param_size = %llu\n",
           gpgpu_ctx->device_runtime->g_max_total_param_size);
 
+  #ifndef VirtualRegisterFile
+    
+    unsigned long long total_checked_cycles = 0;
+    unsigned long long total_phys_reg_count = 0;
+    unsigned long long total_arch_reg_count = 0;
+    unsigned long long max_phys_reg_count = 0;
+    unsigned long long max_arch_reg_count = 0;
+    unsigned long long total_subarray_usage = 0;
+    unsigned long long total_arch_subarray_usage = 0;
+    for (unsigned i=0;i<m_total_core_count;i++) 
+    {
+
+        total_checked_cycles += m_checked_cycles[i];
+        total_phys_reg_count += m_phys_reg_count[i];
+        total_arch_reg_count += m_arch_reg_count[i];
+        if(max_phys_reg_count < m_phys_reg_max[i])
+          max_phys_reg_count = m_phys_reg_max[i];
+        if(max_arch_reg_count < m_arch_reg_max[i])
+          max_arch_reg_count = m_arch_reg_max[i];
+        total_arch_subarray_usage += m_arch_subarray_usage[i];
+        for(unsigned k=0; k<m_shader_config->gpgpu_shader_num_subarrays; k++)
+            total_subarray_usage += m_phys_subarray_usage[i*m_shader_config->gpgpu_shader_num_subarrays + k];
+    }
+      
+    printf("=========================================\n");
+    printf("total checked cycles = %llu\n", total_checked_cycles);
+    printf("total physical register allocated = %llu\n", total_phys_reg_count);
+    printf("total arch register allocated = %llu\n", total_arch_reg_count);
+    printf("max physical register allocated = %llu\n", max_phys_reg_count);
+    printf("max arch register allocated = %llu\n",max_arch_reg_count);
+    printf("total phys subarray utils  = %llu\n", total_subarray_usage);
+    printf("total arch subarray utils  = %llu\n", total_arch_subarray_usage); 
+
+  #endif
+
   // performance counter for stalls due to congestion.
   printf("gpu_stall_dramfull = %d\n", gpu_stall_dramfull);
   printf("gpu_stall_icnt2sh    = %d\n", gpu_stall_icnt2sh);
@@ -1566,6 +1657,13 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
            m_occupied_cta_to_hwtid.end());
     m_occupied_cta_to_hwtid[free_cta_hw_id] = start_thread;
   }
+
+  #ifndef VirtualRegisterFile
+	  m_regs_per_thread = m_config->num_regs_per_thread(kernel);
+    
+    if(m_regs_per_cta < m_regs_per_thread * padded_cta_size / 32)
+		  m_regs_per_cta = m_regs_per_thread * padded_cta_size / 32;
+  #endif
 
   // reset the microarchitecture state of the selected hardware thread and warp
   // contexts
