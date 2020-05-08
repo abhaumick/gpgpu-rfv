@@ -719,6 +719,7 @@ void feature_not_implemented(const char *f) {
       {
         updateRegStats(pI->m_dead_regs[i], true, true, pI);
       }
+    // fprintf(stderr, "\nCheck Done %x\n", pI->get_PC());
     }
   }
 
@@ -754,7 +755,7 @@ void feature_not_implemented(const char *f) {
         stats->lastOp = regWrite;
         #ifndef MULT_RF
           ((shader_core_ctx*)m_core)->renameReg(m_hw_ctaid, m_hw_wid, name, 
-            live, 0);
+            live, stats->numAccess);
           stats->state = live;
         #endif
 
@@ -767,7 +768,7 @@ void feature_not_implemented(const char *f) {
       it = m_regUsageStatsMap.find(name);
       regUsageStats_t *stats = it->second;
       #ifndef MULT_RF
-        ((shader_core_ctx*)m_core)->renameReg(m_hw_ctaid, m_hw_wid, name, live, 0);
+        ((shader_core_ctx*)m_core)->renameReg(m_hw_ctaid, m_hw_wid, name, live, stats->numAccess);
         stats->state = live;
       #endif
     }

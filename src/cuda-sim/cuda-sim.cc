@@ -2647,6 +2647,7 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
       }
     }
 
+  // fprintf(stderr, "Done with pc %x\n", pI->get_PC());
   } catch (int x) {
     printf("GPGPU-Sim PTX: ERROR (%d) executing intruction (%s:%u)\n", x,
            pI->source_file(), pI->source_line());

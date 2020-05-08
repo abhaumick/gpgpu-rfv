@@ -220,8 +220,8 @@ void memory_config::reg_options(class OptionParser *opp) {
 void shader_core_config::reg_options(class OptionParser *opp) {
   #ifndef VirtualRegisterFile
     option_parser_register(opp, "-gpgpu_shader_phys_registers", OPT_UINT32, &gpgpu_shader_physical_registers, 
-                 "Number of phys registers per shader core. Limits number of concurrent CTAs. (default 8192)",
-                 "8192");
+                 "Number of phys registers per shader core. Limits number of concurrent CTAs. (default 65536)",
+                 "65536");
     option_parser_register(opp, "-gpgpu_shader_num_subarrays", OPT_UINT32, &gpgpu_shader_num_subarrays,
                  "Number of register subarrays. (default 4)",
                  "4");

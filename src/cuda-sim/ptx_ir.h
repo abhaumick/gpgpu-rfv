@@ -1600,8 +1600,8 @@ class function_info {
           it->second->set_last_read();
           fprintf(fp, "%s] %x\n", it->first, it->second->m_PC);
       }
-      // branchLifetime();
-      // categorizeRegs(lastPc);
+      branchLifetime();
+      categorizeRegs(lastPc);
       fprintf(stderr, "DOne with Summarize\n");
       fclose(fp);
     }
